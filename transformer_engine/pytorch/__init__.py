@@ -22,3 +22,5 @@ from .te_onnx_extensions import (
     onnx_layernorm_fwd_fp8,
     onnx_layernorm_fwd,
 )
+
+from .float8_tensor import Float8Tensor

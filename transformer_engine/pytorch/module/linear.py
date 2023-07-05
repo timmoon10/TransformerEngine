@@ -42,7 +42,7 @@ from ..cpp_extensions import (
     cast_to_fp8,
 )
 from ..constants import GemmParallelModes, dist_group_type
-
+from ..float8_tensor import Float8Tensor
 
 __all__ = ["Linear"]
 
@@ -56,8 +56,8 @@ class _Linear(torch.autograd.Function):
     def forward(
         ctx,
         weight: torch.Tensor,
-        weight_fp8: Union[torch.Tensor, None],
-        weight_t_fp8: Union[torch.Tensor, None],
+        weight_fp8: Union[Float8Tensor, None],
+        weight_t_fp8: Union[Float8Tensor, None],
         inp: torch.Tensor,
         bias: torch.Tensor,
         use_bias: bool,
@@ -141,12 +141,13 @@ class _Linear(torch.autograd.Function):
                         fp8_meta["scaling_fwd"],
                         tex.FP8FwdTensors.GEMM1_WEIGHT,
                         fp8_dtype_forward,
-                        cast_out=weight_fp8,
-                        transpose_out=weight_t_fp8,
+                        cast_out=weight_fp8._data,
+                        transpose_out=weight_t_fp8._data,
                     )
                 else:
                     weight_t_fp8 = None
-                    weight_fp8 = cast_to_fp8(
+                    # TODO: directly updating `_data` attr isn't a good idea
+                    weight_fp8._data = cast_to_fp8(
                         weight,
                         fp8_meta["scaling_fwd"],
                         tex.FP8FwdTensors.GEMM1_WEIGHT,
@@ -166,7 +167,7 @@ class _Linear(torch.autograd.Function):
                 out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
 
             _ = fp8_gemm(
-                weight_fp8,
+                weight_fp8._data,
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM1_WEIGHT,
                 fp8_dtype_forward,
@@ -323,7 +324,7 @@ class _Linear(torch.autograd.Function):
             if ctx.requires_dgrad:
                 if ctx.fp8:
                     dgrad = fp8_gemm(
-                        weight_t_fp8,
+                        weight_t_fp8._data,
                         fwd_scale_inverses,
                         tex.FP8FwdTensors.GEMM1_WEIGHT,
                         fp8_dtype_forward,
