@@ -78,12 +78,54 @@ class Kernel {
                                 nullptr);
   }
 
+  /*! \brief Launch cooperative CUDA kernel
+   *
+   * Loads the kernel into the device the first time the device is
+   * accessed.
+   *
+   * \param[in] device_id        CUDA device
+   * \param[in] grid_dim         Grid dimensions in blocks
+   * \param[in] block_dim        Thread block dimensions
+   * \param[in] shared_mem_bytes Dynamic shared-memory size per thread block in
+   *                             bytes
+   * \param[in] stream           CUDA stream
+   * \param[in] args             Kernel arguments
+   */
+  template <typename... ArgTs>
+  void launch_cooperative(int device_id,
+                          const dim3 grid_dim,
+                          const dim3 block_dim,
+                          unsigned int shared_mem_bytes,
+                          cudaStream_t stream,
+                          ArgTs &&... args) {
+    void* arg_ptrs[] = { const_cast<void*>(static_cast<const void*>(&args))... };
+    NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchCooperativeKernel,
+                                get_function(device_id),
+                                grid_dim.x,
+                                grid_dim.y,
+                                grid_dim.z,
+                                block_dim.x,
+                                block_dim.y,
+                                block_dim.z,
+                                shared_mem_bytes,
+                                static_cast<CUstream>(stream),
+                                arg_ptrs,
+                                nullptr);
+  }
+
   /*! \brief CUDA function for given CUDA device
    *
    * Loads the kernel into the device the first time the device is
    * accessed.
    */
   CUfunction get_function(int device_id);
+
+  /*! \brief CUDA function on current CUDA device
+   *
+   * Loads the kernel into the device the first time the device is
+   * accessed.
+   */
+  operator CUfunction();
 
  private:
   /*! \brief Mangled function name */
@@ -129,7 +171,7 @@ class KernelManager {
    *
    * \param[in] kernel_label Unique identifying string for kernel
    * \param[in] device_id    CUDA device (default is current device)
-
+   *
    * \return Whether kernel has been compiled
    */
   bool is_compiled(const std::string &kernel_label,
@@ -165,6 +207,16 @@ class KernelManager {
                                  stream,
                                  std::forward<ArgTs>(args)...);
   }
+
+  /*! \brief Get CUDA kernel on current CUDA device
+   *
+   * Assumes the kernel has already been compiled.
+   *
+   * \param[in] kernel_label    Unique identifying string for kernel
+   *
+   * \return CUDA kernel
+   */
+  Kernel &get_kernel(const std::string &kernel_label);
 
  private:
   /*! \brief Compiled kernels */

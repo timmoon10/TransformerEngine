@@ -76,10 +76,12 @@ endfunction()
 list(GET CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES 0 cuda_include_path)
 make_string_header("${cuda_include_path}"
                    string_path_cuda_include)
-make_string_header_from_file(utils.cuh
-                             string_code_utils_cuh)
+make_string_header_from_file(rmsnorm/rtc/rmsnorm_fwd.cu
+                             string_code_rmsnorm_rtc_rmsnorm_fwd_cu)
 make_string_header_from_file(transpose/rtc/transpose.cu
                              string_code_transpose_rtc_transpose_cu)
+make_string_header_from_file(utils.cuh
+                             string_code_utils_cuh)
 target_include_directories(transformer_engine PRIVATE
                            "${CMAKE_CURRENT_BINARY_DIR}/string_headers")
 

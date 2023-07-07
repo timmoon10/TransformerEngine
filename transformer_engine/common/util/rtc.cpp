@@ -131,6 +131,10 @@ CUfunction Kernel::get_function(int device_id) {
   return functions_[device_id];
 }
 
+CUfunction Kernel::operator CUfunction() {
+  return get_function(cuda::current_device());
+}
+
 KernelManager& KernelManager::instance() {
   NVTE_CHECK(is_enabled(), "NVRTC support is not enabled");
   static KernelManager instance_;
@@ -227,6 +231,14 @@ void KernelManager::compile(const std::string &kernel_label,
 bool KernelManager::is_compiled(const std::string &kernel_label, int device_id) const {
   const auto key = get_kernel_cache_key(kernel_label, device_id);
   return kernel_cache_.count(key) > 0;
+}
+
+Kernel &KernelManager::get_kernel(const std::string &kernel_label) {
+  const int device_id = cuda::current_device();
+  const auto key = get_kernel_cache_key(kernel_label, device_id);
+  NVTE_CHECK(kernel_cache_.count(key) > 0,
+             "Attempted to access RTC kernel before compilation");
+  return kernel_cache_.at(key);
 }
 
 std::string KernelManager::get_kernel_cache_key(const std::string &kernel_label,
