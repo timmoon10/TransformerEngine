@@ -43,6 +43,7 @@ from ..cpp_extensions import (
 )
 from ..constants import GemmParallelModes, dist_group_type
 from ..float8_tensor import Float8Tensor
+from ..float8_utils import E4M3, tensor_to_scale
 
 __all__ = ["Linear"]
 
@@ -76,6 +77,7 @@ class _Linear(torch.autograd.Function):
         ub_split_rs: bool,
         ub_split_ag: bool,
     ) -> torch.Tensor:
+        print(f"{is_first_microbatch}")
         # Make sure input dimensions are compatible
         in_features = weight.shape[-1]
         assert inp.shape[-1] == in_features, "GEMM not possible"
@@ -136,14 +138,18 @@ class _Linear(torch.autograd.Function):
 
             if update_fp8_weights:
                 if is_grad_enabled:
-                    fp8_cast_transpose_fused(
-                        weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward,
-                        cast_out=weight_fp8._data,
-                        transpose_out=weight_t_fp8._data,
-                    )
+                    # fp8_cast_transpose_fused(
+                    #     weight,
+                    #     fp8_meta["scaling_fwd"],
+                    #     tex.FP8FwdTensors.GEMM1_WEIGHT,
+                    #     fp8_dtype_forward,
+                    #     cast_out=weight_fp8._data,
+                    #     transpose_out=weight_t_fp8._data,
+                    # )
+                    weight_t_fp8._data = weight._data.transpose(0,1).clone().detach()
+                    weight_t_fp8._scale = weight._scale.clone().detach()
+                    weight_t_fp8._flavor = weight._flavor
+                    # weight_t_fp8.fp8_meta_view = weight.fp8_meta_view
                 else:
                     weight_t_fp8 = None
                     # TODO: directly updating `_data` attr isn't a good idea
@@ -167,7 +173,7 @@ class _Linear(torch.autograd.Function):
                 out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
 
             _ = fp8_gemm(
-                weight_fp8._data,
+                weight._data,
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM1_WEIGHT,
                 fp8_dtype_forward,
@@ -560,21 +566,38 @@ class Linear(TransformerEngineBaseModule):
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
 
         if not skip_weight_param_allocation:
-            self.register_buffer("weight_tensor",
-                                 torch.empty(
-                                    self.out_features,
-                                    self.in_features,
-                                    device=torch.cuda.current_device(),
-                                    dtype=params_dtype),
-                                 persistent=False)
+            temp_weight = torch.empty(
+                self.out_features,
+                self.in_features,
+                device=torch.cuda.current_device(),
+                dtype=params_dtype
+            )
 
             initialize_affine_weight_gpu(
-                self.weight_tensor,
+                temp_weight,
                 init_method,
                 get_rng_state_tracker,
                 partition_dim=1 if self.parallel_mode == "row" else 0,
                 stride=1,
             )
+
+            # print(self.fp8_meta)
+            # Assign the correct scale to the `fp8_meta` dictionary
+            # self.fp8_meta["scaling_fwd"][1] = tensor_to_scale(temp_weight, E4M3)
+            self.register_buffer("weight_tensor",
+                        Float8Tensor.from_float32(
+                            temp_weight,
+                            tensor_to_scale(temp_weight, E4M3),
+                            E4M3
+                        ),
+                        persistent=False)
+
+            # XXX: How to do update the fp8_meta dictionary with this info
+            # XXX: This is a hack for now. Need to assign this view variable
+            # properly. Currently, can't use `cast_to_fp8` since most of the
+            # information of `fp8_meta` is added once in `prepare_forward`
+            # context manager
+            self.weight_tensor.fp8_meta_view = self.fp8_meta
 
             if self.use_bias:
                 self.register_buffer("bias_tensor",
@@ -608,9 +631,13 @@ class Linear(TransformerEngineBaseModule):
                 wname = pname + "weight"
                 bname = pname + "bias"
 
+                print("before parameter init")
+                wparam = Parameter(self.weight_tensor)
+                print("after parameter init")
                 self.register_parameter(
-                    wname, Parameter(self.weight_tensor[i * split_size : (i+1) * split_size])
+                    wname, wparam
                 )
+                print("after register param")
 
                 set_tensor_model_parallel_attributes(
                     tensor=getattr(self, wname),
@@ -647,7 +674,7 @@ class Linear(TransformerEngineBaseModule):
     def get_fp8_weights_scratchpad(
         self,
         is_first_microbatch: Union[bool, None],
-    ) -> List[torch.Tensor]:
+    ) -> List[Float8Tensor]:
         """
         Fetch the fp8 weight tensor placeholders if they exist (when
         `is_first_microbatch` is not `None`) or return empty fp8 weight
@@ -752,7 +779,6 @@ class Linear(TransformerEngineBaseModule):
                 self.ub_split_ag,
             )
             out = linear_fn(*args)
-
         if self.gemm_bias_unfused_add:
             out = out + cast_if_needed(bias_tensor, self.activation_dtype)
 

@@ -486,21 +486,27 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             setattr(
                 self,
                 weight_cast_attr,
-                torch.empty(
-                    shape,
-                    device=torch.cuda.current_device(),
-                    dtype=torch.uint8,
-                ),
+                Float8Tensor(
+                    torch.empty(
+                        shape,
+                        device=torch.cuda.current_device(),
+                        dtype=torch.uint8,
+                    ),
+                    scale=None, flavor=None
+                )
             )
             setattr(
                 self,
                 weight_transpose_attr,
-                torch.empty(
-                    shape[1],
-                    shape[0],
-                    device=torch.cuda.current_device(),
-                    dtype=torch.uint8,
-                ),
+                Float8Tensor(
+                    torch.empty(
+                        shape[1],
+                        shape[0],
+                        device=torch.cuda.current_device(),
+                        dtype=torch.uint8,
+                    ),
+                    scale=None, flavor=None
+                )
             )
 
     def set_tensor_parallel_group(self, tp_group: Union[dist_group_type, None]) -> None:

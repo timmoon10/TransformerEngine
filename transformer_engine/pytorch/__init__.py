@@ -24,3 +24,4 @@ from .te_onnx_extensions import (
 )
 
 from .float8_tensor import Float8Tensor
+from .float8_aten_api import *
