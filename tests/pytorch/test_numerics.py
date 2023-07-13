@@ -440,10 +440,12 @@ def test_gpt_selective_activation_recompute(dtype, bs, model):
             hidden_dropout=0.1,
             attention_dropout=0.1,
             kv_channels=config.embed,
+            self_attn_mask_type='causal',
             apply_residual_connection_post_layernorm=False,
             output_layernorm=False,
             get_rng_state_tracker=get_dummy_cuda_rng_tracker,
             params_dtype=dtype,
+            qkv_weight_interleaved=True,
         )
         .cuda()
         .eval()
@@ -511,10 +513,12 @@ def test_gpt_full_activation_recompute(dtype, bs, model):
             hidden_dropout=0.1,
             attention_dropout=0.1,
             kv_channels=config.embed,
+            self_attn_mask_type='causal',
             apply_residual_connection_post_layernorm=False,
             output_layernorm=False,
             get_rng_state_tracker=get_dummy_cuda_rng_tracker,
             params_dtype=dtype,
+            qkv_weight_interleaved=True,
         )
         .cuda()
         .eval()
@@ -540,9 +544,11 @@ def _test_e2e_checkpointing_get_model(config, dtype):
             hidden_dropout=0.1,
             attention_dropout=0.1,
             kv_channels=config.embed,
+            self_attn_mask_type='causal',
             apply_residual_connection_post_layernorm=False,
             output_layernorm=False,
             params_dtype=dtype,
+            qkv_weight_interleaved=True,
         )
         .cuda()
         .eval()
@@ -656,8 +662,7 @@ def test_gpt_accuracy(dtype, bs, model):
             layernorm_epsilon=config.eps,
             attention_dropout=0.1,
             hidden_dropout=0.1,
-            fuse_qkv_params=True,
-            qkv_weight_interleaved=False,
+            self_attn_mask_type='causal',
         )
         .to(dtype=dtype)
         .cuda()
@@ -1005,8 +1010,10 @@ def test_gpt_cuda_graph(dtype, bs, model):
             hidden_dropout=0.1,
             attention_dropout=0.1,
             kv_channels=config.embed,
+            self_attn_mask_type='causal',
             apply_residual_connection_post_layernorm=False,
             output_layernorm=False,
+            qkv_weight_interleaved=True,
         )
         .to(dtype=dtype)
         .cuda()

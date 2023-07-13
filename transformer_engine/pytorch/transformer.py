@@ -119,7 +119,7 @@ class TransformerLayer(torch.nn.Module):
     kv_channels: int, default = `None`
                 number of key-value channels. defaults to
                 :attr:`hidden_size` / :attr:`num_attention_heads` if `None`.
-    self_attn_mask_type: {'causal', 'padding'}, default = `causal`
+    self_attn_mask_type: {'no_mask', 'causal', 'padding'}, default = `no_mask`
                         type of attention mask passed into softmax operation.
     zero_centered_gamma : bool, default = 'False'
                          if set to 'True', gamma parameter in LayerNorm is initialized to 0 and
@@ -199,7 +199,7 @@ class TransformerLayer(torch.nn.Module):
         output_layer_init_method: Optional[Callable] = None,
         layer_number: Optional[int] = None,
         kv_channels: Optional[int] = None,
-        self_attn_mask_type: str = "causal",
+        self_attn_mask_type: str = "no_mask",
         tp_group: Optional[dist_group_type] = None,
         tp_size: int = 1,
         params_dtype: Optional[torch.dtype] = None,
@@ -215,9 +215,9 @@ class TransformerLayer(torch.nn.Module):
         layer_type: str = "encoder",
         drop_path_rate: float = 0.0,
         set_parallel_mode: bool = False,
-        fuse_qkv_params: bool = False,
+        fuse_qkv_params: bool = True,
         zero_centered_gamma: bool = False,
-        qkv_weight_interleaved: bool = True,
+        qkv_weight_interleaved: bool = False,
         ub_tp_comm_overlap: bool = False,
         bias: bool = True,
         activation: str = 'gelu'

@@ -130,7 +130,7 @@ class UnfusedDotProductAttention(torch.nn.Module):
         norm_factor: float,
         attention_dropout: float = 0.0,
         attention_dropout_ctx: Optional[Callable] = nullcontext,
-        attn_mask_type: str = "causal",
+        attn_mask_type: str = "no_mask",
         layer_number: Optional[int] = None,
     ) -> None:
         super().__init__()
@@ -714,7 +714,7 @@ class DotProductAttention(torch.nn.Module):
                 number of key-value channels.
     attention_dropout: float, default = 0.0
                       dropout probability for the dropout op during multi-head attention.
-    attn_mask_type: {'causal', 'padding'}, default = `causal`
+    attn_mask_type: {'no_mask', 'causal', 'padding'}, default = `no_mask`
                    type of attention mask passed into softmax operation.
     layer_number: int, default = `None`
                  layer number of the current `DotProductAttention` when multiple such modules
@@ -735,7 +735,7 @@ class DotProductAttention(torch.nn.Module):
         num_attention_heads: int,
         kv_channels: int,
         attention_dropout: float = 0.0,
-        attn_mask_type: str = "causal",
+        attn_mask_type: str = "no_mask",
         sequence_parallel: bool = False,
         tp_size: int = 1,
         get_rng_state_tracker: Optional[Callable] = None,
@@ -956,7 +956,7 @@ class MultiHeadAttention(torch.nn.Module):
         init_method: Callable,
         output_layer_init_method: Callable,
         layer_number: Optional[int] = None,
-        attn_mask_type: str = "causal",
+        attn_mask_type: str = "no_mask",
         tp_group: Optional[dist_group_type] = None,
         tp_size: int = 1,
         fuse_wgrad_accumulation: bool = False,
@@ -967,9 +967,9 @@ class MultiHeadAttention(torch.nn.Module):
         input_layernorm: bool = False,
         attention_type: str = "self",
         set_parallel_mode: bool = False,
-        fuse_qkv_params: bool = False,
+        fuse_qkv_params: bool = True,
         zero_centered_gamma: bool = False,
-        qkv_weight_interleaved: bool = True,
+        qkv_weight_interleaved: bool = False,
         ub_bulk_wgrad: bool = False,
         ub_bulk_dgrad: bool = False,
         ub_split_rs: bool = False,
