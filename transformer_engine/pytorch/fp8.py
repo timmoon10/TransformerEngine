@@ -369,7 +369,7 @@ def update_amax_history(amax_history: torch.Tensor) -> torch.Tensor:
     return amax_history
 
 
-@jit_fuser
+# @jit_fuser
 def _default_get_amax(
     amax_history: torch.Tensor,
     amax_compute_algo: str,
@@ -384,7 +384,7 @@ def _default_get_amax(
     return amax_history, amax
 
 
-@jit_fuser
+# @jit_fuser
 def _default_sf_compute(
     amax: torch.Tensor,
     scale: torch.Tensor,
@@ -401,7 +401,7 @@ def _default_sf_compute(
     return sf
 
 
-@jit_fuser
+# @jit_fuser
 def _compute_scaling_factor_inverse(
     scale: torch.Tensor,
     scale_inv: torch.Tensor,
@@ -414,7 +414,7 @@ def _compute_scaling_factor_inverse(
     return torch.where(non_weight_mask, 1.0 / scale, scale_inv)
 
 
-@jit_fuser
+# @jit_fuser
 def fused_amax_and_scale_update(
     amax_history: torch.Tensor,
     scale: torch.Tensor,
@@ -432,6 +432,7 @@ def fused_amax_and_scale_update(
         amax_history,
         amax_compute_algo,
     )
+    print("fp8.py: ", amax)
 
     # Calculate new scaling factor.
     scale = _default_sf_compute(

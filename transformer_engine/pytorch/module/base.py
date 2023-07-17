@@ -587,6 +587,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                     amax_and_scale_update(
                         self.fp8_meta, True, update_weight_scale_inv=update_weight_scale_inv
                     )
+                    print("after amax scale update")
                     set_amax_buffer_key_deletion(self.fp8_meta, forward=True)
                 else:
                     amax_and_scale_update(

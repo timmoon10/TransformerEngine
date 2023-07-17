@@ -4,6 +4,12 @@ from torch.utils._pytree import tree_map
 aten = torch.ops.aten
 c10d = torch.ops.c10d
 
+from .cpp_extensions import (
+    cast_to_fp8,
+)
+from .fp8 import get_fp8_te_dtype
+import transformer_engine_extensions as tex
+
 class Float8ConstrFunc(torch.autograd.Function):
     """
     A differentiable conversion between fp32 and fp8
@@ -84,8 +90,16 @@ class Float8Tensor(torch.Tensor):
         return f"Float8Tensor(flavor={self._flavor}, scale={self._scale}, as_float32={self.to_float32()}"
 
     @classmethod
+    def update_inplace_fp8_tensor(cls, t, u):
+        if isinstance(t, Float8Tensor) and isinstance(u, Float8Tensor):
+            t._data = u._data
+            t._scale = u._scale
+            t._flavor = u._flavor
+
+    @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
         print(func)
+        # print(type(args), len(args))
 
         def maybe_unwrap(t):
             if isinstance(t, Float8Tensor):
@@ -96,6 +110,49 @@ class Float8Tensor(torch.Tensor):
             if not isinstance(t, Float8Tensor):
                 return Float8Tensor.from_float32(t, tensor_to_scale(t, E4M3), E4M3)
             return t
+
+        # override addition so we can add e5m2 gradients
+        if func is aten.add_.Tensor:
+            # NOTE: This check could fail if the input types are swapped.
+            #       Need to confirm that the optimizer does (weights + delta)
+            #       in that order (delta ~ grads).
+            assert isinstance(args[0], Float8Tensor) and \
+                    isinstance(args[1], torch.Tensor), \
+                    "recheck the input types for the tensor add " \
+                    "operation"
+
+            # For now, doing this only for FP32, but this should be done based
+            # on the types of the `delta` (grads tensor)
+            weights_fp32 = args[0].to_float32()
+            new_weights = weights_fp32 + args[1]
+
+            ## Method 1: Convert the higher precision tensor to FP8 using
+            ##           PoC's methods. This doesn't update the amax
+            ##           history / scales.
+            # # Convert the weights back to Float8Tensor
+            # res = Float8Tensor.from_float32(
+            #     new_weights,
+            #     tensor_to_scale(new_weights, E4M3),
+            #     E4M3
+            # )
+            # # Need to update the FP8 weights inplace with the new data/scale
+            # Float8Tensor.update_inplace_fp8_tensor(args[0], res)
+
+            ## Method 2: Convert the higher precision tensor to FP8 using
+            ##           TE's native `cast_to_fp8` function
+            fp8_dtype_forward = get_fp8_te_dtype(
+                args[0].fp8_meta_view["recipe"], fprop_tensor=True
+            )
+
+            args[0]._data = cast_to_fp8(
+                new_weights,
+                args[0].fp8_meta_view["scaling_fwd"],
+                tex.FP8FwdTensors.GEMM1_WEIGHT,
+                fp8_dtype_forward,
+            )
+
+            # This is an inplace addition op, so nothing to return
+            return None
 
         if func == aten.detach.default:
 
@@ -114,6 +171,7 @@ class Float8Tensor(torch.Tensor):
             ## Method 2: simply return a new `Float8Tensor` with the `_data`,
             ## `_scale` & `_flavor` referencing the original `Float8Tensor`
             original_fp8_tensor = args[0]
+            # print(hasattr(original_fp8_tensor, "fp8_meta_view"))
             # `Float8Tensor` by default has `requires_grad=False` so this
             # should work.
             # NOTE: When initializing parameters as `Float8Tensor` inside module
@@ -124,6 +182,10 @@ class Float8Tensor(torch.Tensor):
                 original_fp8_tensor._scale,
                 original_fp8_tensor._flavor
             )
+
+            # Also add the view to `fp8_meta` object
+            if hasattr(original_fp8_tensor, "fp8_meta_view"):
+                out.fp8_meta_view = original_fp8_tensor.fp8_meta_view
 
         else:
             out = super().__torch_dispatch__(func, types, args, kwargs)
