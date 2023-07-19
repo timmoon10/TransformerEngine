@@ -359,11 +359,24 @@ class CMakeExtension(setuptools.Extension):
 
         # Run CMake commands
         for command in [configure_command, build_command, install_command]:
+
+            ### TODO Remove
+            print('Running command: df -h')
+            subprocess.run(['df', '-h'])
+            print('Running command: free')
+            subprocess.run(['free'])
+
             print(f"Running command {' '.join(command)}")
             try:
                 subprocess.run(command, cwd=build_dir, check=True)
             except (CalledProcessError, OSError) as e:
                 raise RuntimeError(f"Error when running CMake: {e}")
+
+        ### TODO Remove
+        print('Running command: df -h')
+        subprocess.run(['df', '-h'])
+        print('Running command: free')
+        subprocess.run(['free'])
 
 
 # PyTorch extension modules require special handling
