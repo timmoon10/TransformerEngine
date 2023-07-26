@@ -188,6 +188,7 @@ class Float8Tensor(torch.Tensor):
                 out.fp8_meta_view = original_fp8_tensor.fp8_meta_view
 
         else:
+            # TODO(ksivaman): wrap with fp8 casts
             out = super().__torch_dispatch__(func, types, args, kwargs)
 
         return out

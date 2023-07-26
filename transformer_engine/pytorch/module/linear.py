@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 
 """Linear API"""
+import warnings
 from typing import Union, Optional, Callable, Tuple, List, Dict, Any
 
 import torch
@@ -24,7 +25,7 @@ from ..utils import (
     divide,
     get_default_init_method,
     cast_if_needed,
-    assert_dim_for_fp8_forward_exec,
+    assert_dim_for_fp8_exec,
 )
 from ..distributed import (
     set_tensor_model_parallel_attributes,
@@ -42,6 +43,8 @@ from ..cpp_extensions import (
     cast_to_fp8,
 )
 from ..constants import GemmParallelModes, dist_group_type
+from ..jit import no_torch_dynamo
+
 from ..float8_tensor import Float8Tensor
 from ..float8_utils import E4M3, tensor_to_scale
 
@@ -77,14 +80,14 @@ class _Linear(torch.autograd.Function):
         ub_split_rs: bool,
         ub_split_ag: bool,
     ) -> torch.Tensor:
-        print(f"{is_first_microbatch}")
+        print(f"is_first_microbatch {is_first_microbatch}")
         # Make sure input dimensions are compatible
         in_features = weight.shape[-1]
         assert inp.shape[-1] == in_features, "GEMM not possible"
         inputmat = inp.view((-1, in_features))
         if fp8:
-            assert_dim_for_fp8_forward_exec(inputmat)
-            assert_dim_for_fp8_forward_exec(weight)
+            assert_dim_for_fp8_exec(inputmat)
+            assert_dim_for_fp8_exec(weight)
 
         update_fp8_weights = is_first_microbatch is None or is_first_microbatch
 
@@ -143,16 +146,15 @@ class _Linear(torch.autograd.Function):
                     #     fp8_meta["scaling_fwd"],
                     #     tex.FP8FwdTensors.GEMM1_WEIGHT,
                     #     fp8_dtype_forward,
-                    #     cast_out=weight_fp8._data,
-                    #     transpose_out=weight_t_fp8._data,
+                    #     cast_out=weight_fp8,
+                    #     transpose_out=weight_t_fp8,
                     # )
                     weight_t_fp8._data = weight._data.transpose(0,1).clone().detach()
                     weight_t_fp8._scale = weight._scale.clone().detach()
                     weight_t_fp8._flavor = weight._flavor
-                    # weight_t_fp8.fp8_meta_view = weight.fp8_meta_view
                 else:
                     weight_t_fp8 = None
-                    # TODO: directly updating `_data` attr isn't a good idea
+                    # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
                     weight_fp8._data = cast_to_fp8(
                         weight,
                         fp8_meta["scaling_fwd"],
@@ -448,6 +450,11 @@ class Linear(TransformerEngineBaseModule):
 
     On NVIDIA GPUs it is a drop-in replacement for `torch.nn.Linear`.
 
+    .. warning::
+
+        Argument :attr:`skip_weight_param_allocation` is deprecated and will
+        be fully removed in future releases.
+
     Parameters
     ----------
     in_features : int
@@ -481,9 +488,6 @@ class Linear(TransformerEngineBaseModule):
                    used to decide whether this Linear layer is Column Parallel Linear or Row
                    Parallel Linear as described `here <https://arxiv.org/pdf/1909.08053.pdf>`_.
                    When set to `None`, no communication is performed.
-    skip_weight_param_allocation: bool, default = `False`
-                                 if set to `True`, weight parameter is not allocated and must be
-                                 passed as a keyword argument `weight` during the forward pass.
 
     Optimization parameters
     -----------------------
@@ -525,6 +529,14 @@ class Linear(TransformerEngineBaseModule):
     ) -> None:
         super().__init__()
 
+        if skip_weight_param_allocation:
+            warnings.warn(
+                "Argument `skip_weight_param_allocation` is deprecated and"
+                "will be fully removed in future releases. It has ignored"
+                "starting from v0.11.",
+                category=DeprecationWarning,
+            )
+
         params_dtype = torch.get_default_dtype() if params_dtype is None else params_dtype
         self.in_features = in_features
         self.out_features = out_features
@@ -565,102 +577,95 @@ class Linear(TransformerEngineBaseModule):
 
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
 
-        if not skip_weight_param_allocation:
-            temp_weight = torch.empty(
-                self.out_features,
-                self.in_features,
-                device=torch.cuda.current_device(),
-                dtype=params_dtype
-            )
+        temp_weight = torch.empty(
+            self.out_features, self.in_features,
+            device=torch.cuda.current_device(),
+            dtype=params_dtype)
 
-            initialize_affine_weight_gpu(
-                temp_weight,
-                init_method,
-                get_rng_state_tracker,
-                partition_dim=1 if self.parallel_mode == "row" else 0,
+        # TODO(ksivaman): This functionality works with FP8 outside TE.
+        initialize_affine_weight_gpu(
+            temp_weight,
+            init_method,
+            get_rng_state_tracker,
+            partition_dim=1 if self.parallel_mode == "row" else 0,
+            stride=1,
+        )
+
+        # Assign the correct scale to the `fp8_meta` dictionary
+        # self.fp8_meta["scaling_fwd"][1] = tensor_to_scale(temp_weight, E4M3)
+        # TODO(ksivaman): Remove hardcoded fp8 weight and hardcoded FP8 flavor.
+        self.weight_tensor = Float8Tensor.from_float32(
+            temp_weight,
+            tensor_to_scale(temp_weight, E4M3),
+            E4M3,
+        )
+
+        # XXX: How to do update the fp8_meta dictionary with this info
+        # XXX: This is a hack for now. Need to assign this view variable
+        # properly. Currently, can't use `cast_to_fp8` since most of the
+        # information of `fp8_meta` is added once in `prepare_forward`
+        # context manager
+        self.weight_tensor.fp8_meta_view = self.fp8_meta
+
+        if self.use_bias:
+            self.bias_tensor = torch.empty(
+                self.out_features,
+                device=torch.cuda.current_device(),
+                dtype=params_dtype)
+        else:
+            self.bias_tensor = torch.Tensor().to(dtype=params_dtype,
+                                                    device=torch.cuda.current_device())
+
+        with torch.no_grad():
+            self.bias_tensor.zero_()
+
+        if parameters_split is None:
+            parameters_split = ("",)
+
+        assert (
+            self.out_features % len(parameters_split) == 0
+        ), f"Weight and bias params cannot be split into {len(parameters_split)} parts"
+
+        split_size = self.out_features // len(parameters_split)
+
+        self.weight_names = []
+        self.bias_names = []
+
+        for i, pname in enumerate(parameters_split):
+            wname = pname + "weight"
+            bname = pname + "bias"
+
+            print("before parameter init")
+            wparam = Parameter(self.weight_tensor)
+            print("after parameter init")
+
+            # TODO(ksivaman): Add indexing op to torch dispatcher for float8
+            # self.register_parameter(
+            #     wname, Parameter(self.weight_tensor[i * split_size : (i+1) * split_size])
+            # )
+            self.register_parameter(wname, wparam)
+            print("after register param")
+
+            set_tensor_model_parallel_attributes(
+                tensor=getattr(self, wname),
+                is_parallel=True,
+                dim=1 if parallel_mode == "row" else 0,
                 stride=1,
             )
 
-            # print(self.fp8_meta)
-            # Assign the correct scale to the `fp8_meta` dictionary
-            # self.fp8_meta["scaling_fwd"][1] = tensor_to_scale(temp_weight, E4M3)
-            self.register_buffer("weight_tensor",
-                        Float8Tensor.from_float32(
-                            temp_weight,
-                            tensor_to_scale(temp_weight, E4M3),
-                            E4M3
-                        ),
-                        persistent=False)
-
-            # XXX: How to do update the fp8_meta dictionary with this info
-            # XXX: This is a hack for now. Need to assign this view variable
-            # properly. Currently, can't use `cast_to_fp8` since most of the
-            # information of `fp8_meta` is added once in `prepare_forward`
-            # context manager
-            self.weight_tensor.fp8_meta_view = self.fp8_meta
-
             if self.use_bias:
-                self.register_buffer("bias_tensor",
-                                     torch.empty(
-                                         self.out_features,
-                                         device=torch.cuda.current_device(),
-                                         dtype=params_dtype),
-                                     persistent=False)
-            else:
-                self.register_buffer("bias_tensor",
-                                     torch.Tensor().to(dtype=params_dtype,
-                                                       device=torch.cuda.current_device()),
-                                     persistent=False)
-
-            with torch.no_grad():
-                self.bias_tensor.zero_()
-
-            if parameters_split is None:
-                parameters_split = ("",)
-
-            assert (
-                self.out_features % len(parameters_split) == 0
-            ), f"Weight and bias params cannot be split into {len(parameters_split)} parts"
-
-            split_size = self.out_features // len(parameters_split)
-
-            self.weight_names = []
-            self.bias_names = []
-
-            for i, pname in enumerate(parameters_split):
-                wname = pname + "weight"
-                bname = pname + "bias"
-
-                print("before parameter init")
-                wparam = Parameter(self.weight_tensor)
-                print("after parameter init")
                 self.register_parameter(
-                    wname, wparam
+                    bname, Parameter(self.bias_tensor[i * split_size : (i+1) * split_size])
                 )
-                print("after register param")
+            else:
+                setattr(self, bname, torch.Tensor().to(dtype=params_dtype,
+                                                        device=torch.cuda.current_device()))
 
-                set_tensor_model_parallel_attributes(
-                    tensor=getattr(self, wname),
-                    is_parallel=True,
-                    dim=1 if parallel_mode == "row" else 0,
-                    stride=1,
-                )
+            if parallel_mode == "column":
+                set_tensor_model_parallel_attributes(getattr(self, bname), True, 0, 1)
 
-                if self.use_bias:
-                    self.register_parameter(
-                        bname, Parameter(self.bias_tensor[i * split_size : (i+1) * split_size])
-                    )
-                else:
-                    self.register_buffer(bname,
-                                         torch.Tensor().to(dtype=params_dtype,
-                                                           device=torch.cuda.current_device()),
-                                         persistent=False)
-
-                if parallel_mode == "column":
-                    set_tensor_model_parallel_attributes(getattr(self, bname), True, 0, 1)
-
-                self.weight_names.append(wname)
-                self.bias_names.append(bname)
+            self.weight_names.append(wname)
+            self.bias_names.append(bname)
 
         self.fp8_weight_shapes.append(torch.Size((self.out_features, self.in_features)))
 
@@ -695,6 +700,7 @@ class Linear(TransformerEngineBaseModule):
 
         return fp8_weight_tensors
 
+    @no_torch_dynamo
     def forward(
         self,
         inp: torch.Tensor,
@@ -705,17 +711,15 @@ class Linear(TransformerEngineBaseModule):
         """
         Apply the linear transformation to the input.
 
+        .. warning::
+
+            Arguments :attr:`weight` and :attr:`bias` are deprecated and will
+            be fully removed in future releases.
+
         Parameters
         ----------
         inp : torch.Tensor
              Input tensor.
-        weight : torch.Tensor, default = None
-                An optional weight tensor for the module. This argument is compulsory if module
-                is initialized with `skip_weight_param_allocation=True`
-        bias : torch.Tensor, default = None
-              An optional bias tensor for the module. This argument is compulsory if module
-              is initialized with `skip_weight_param_allocation=True` and one of `use_bias`
-              or `return_bias`
         is_first_microbatch : {True, False, None}, default = None
                              During training using either gradient accumulation or
                              pipeline parallelism a minibatch of data is further split
@@ -731,16 +735,20 @@ class Linear(TransformerEngineBaseModule):
                                produced)
         """
 
+        if weight is not None or bias is not None:
+            raise RuntimeError(
+                "Arguments `weight` and `bias` are deprecated and "
+                "will be fully removed in future releases."
+            )
+
         with self.prepare_forward(inp, is_first_microbatch) as inp:
             bias_tensor = (
-                bias if bias is not None
-                else self.bias if self.parameters_split is None
+                self.bias if self.parameters_split is None
                 else self.bias_tensor if not torch.is_grad_enabled()
                 else self.noop_cat("bias_tensor", self.bias_names)
             )
             weight_tensor = (
-                weight if weight is not None
-                else self.weight if self.parameters_split is None
+                self.weight if self.parameters_split is None
                 else self.weight_tensor if not torch.is_grad_enabled()
                 else self.noop_cat("weight_tensor", self.weight_names)
             )
@@ -779,6 +787,7 @@ class Linear(TransformerEngineBaseModule):
                 self.ub_split_ag,
             )
             out = linear_fn(*args)
+
         if self.gemm_bias_unfused_add:
             out = out + cast_if_needed(bias_tensor, self.activation_dtype)
 
