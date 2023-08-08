@@ -98,8 +98,8 @@ class Float8Tensor(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
-        print(func)
-        # print(type(args), len(args))
+        print(f"[Floa8Tensor Torch Dispatch] func: {func}\n func inplace: {func._schema.is_mutable}\n mutable args: {[a.is_out for a in func._schema.arguments]}")
+        print(f"{[a.is_out for a in func._schema.arguments]}")
 
         def maybe_unwrap(t):
             if isinstance(t, Float8Tensor):
@@ -154,6 +154,38 @@ class Float8Tensor(torch.Tensor):
             # This is an inplace addition op, so nothing to return
             return None
 
+        if func == aten.slice.Tensor:
+            print([type(a) for a in args])
+            original_fp8_tensor = args[0]
+            args = (args[0]._data,) + args[1:]
+            out = func(*args, **kwargs)
+
+            # TODO: The scale should be for this slice of the tensor and not the
+            # same as the original tensor
+            out = Float8Tensor(
+                out,
+                original_fp8_tensor._scale.detach().clone(),
+                original_fp8_tensor._flavor
+            )
+
+            # Also add the view to `fp8_meta` object
+            if hasattr(original_fp8_tensor, "fp8_meta_view"):
+                out.fp8_meta_view = original_fp8_tensor.fp8_meta_view
+
+            return out
+
+        if func == aten.transpose.int:
+            original_fp8_tensor = args[0]
+            out = Float8Tensor(
+                original_fp8_tensor._data.transpose(0,1).detach().clone(),
+                original_fp8_tensor._scale.detach().clone(),
+                original_fp8_tensor._flavor
+            )
+            # Also add the view to `fp8_meta` object
+            if hasattr(original_fp8_tensor, "fp8_meta_view"):
+                out.fp8_meta_view = original_fp8_tensor.fp8_meta_view
+            return out
+
         if func == aten.detach.default:
 
             ## Method 1: cast args to fp32, then recast the `out` to fp8
@@ -187,9 +219,18 @@ class Float8Tensor(torch.Tensor):
             if hasattr(original_fp8_tensor, "fp8_meta_view"):
                 out.fp8_meta_view = original_fp8_tensor.fp8_meta_view
 
-        else:
-            # TODO(ksivaman): wrap with fp8 casts
-            out = super().__torch_dispatch__(func, types, args, kwargs)
+            return out
+
+        # TODO: (ksivaman) For all other cases, cast back to higher precision
+        # weights, then convert back to FP8
+        args = tree_map(maybe_unwrap, args)
+        if kwargs is not None:
+            kwargs = tree_map(maybe_unwrap, kwargs)
+
+        out = super().__torch_dispatch__(func, types, args, kwargs)
+
+        # Convert the output back to FP8
+        out = tree_map(maybe_wrap, out)
 
         return out
 

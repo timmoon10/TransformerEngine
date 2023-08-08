@@ -141,17 +141,7 @@ class _Linear(torch.autograd.Function):
 
             if update_fp8_weights:
                 if is_grad_enabled:
-                    # fp8_cast_transpose_fused(
-                    #     weight,
-                    #     fp8_meta["scaling_fwd"],
-                    #     tex.FP8FwdTensors.GEMM1_WEIGHT,
-                    #     fp8_dtype_forward,
-                    #     cast_out=weight_fp8,
-                    #     transpose_out=weight_t_fp8,
-                    # )
-                    weight_t_fp8._data = weight._data.transpose(0,1).clone().detach()
-                    weight_t_fp8._scale = weight._scale.clone().detach()
-                    weight_t_fp8._flavor = weight._flavor
+                    weight_t_fp8 = weight.transpose(0, 1)
                 else:
                     weight_t_fp8 = None
                     # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
@@ -526,6 +516,7 @@ class Linear(TransformerEngineBaseModule):
         parameters_split: Optional[Tuple[str, ...]] = None,
         ub_split_rs: bool = False,
         ub_split_ag: bool = False,
+        primary_weights_in_fp8 = False,
     ) -> None:
         super().__init__()
 
@@ -591,21 +582,25 @@ class Linear(TransformerEngineBaseModule):
             stride=1,
         )
 
-        # Assign the correct scale to the `fp8_meta` dictionary
-        # self.fp8_meta["scaling_fwd"][1] = tensor_to_scale(temp_weight, E4M3)
-        # TODO(ksivaman): Remove hardcoded fp8 weight and hardcoded FP8 flavor.
-        self.weight_tensor = Float8Tensor.from_float32(
-            temp_weight,
-            tensor_to_scale(temp_weight, E4M3),
-            E4M3,
-        )
+        if primary_weights_in_fp8 == True:
+            print("assigning weights in fp8")
+            # Assign the correct scale to the `fp8_meta` dictionary
+            # self.fp8_meta["scaling_fwd"][1] = tensor_to_scale(temp_weight, E4M3)
+            # TODO(ksivaman): Remove hardcoded fp8 weight and hardcoded FP8 flavor.
+            self.weight_tensor = Float8Tensor.from_float32(
+                temp_weight,
+                tensor_to_scale(temp_weight, E4M3),
+                E4M3,
+            )
 
-        # XXX: How to do update the fp8_meta dictionary with this info
-        # XXX: This is a hack for now. Need to assign this view variable
-        # properly. Currently, can't use `cast_to_fp8` since most of the
-        # information of `fp8_meta` is added once in `prepare_forward`
-        # context manager
-        self.weight_tensor.fp8_meta_view = self.fp8_meta
+            # XXX: How to do update the fp8_meta dictionary with this info
+            # XXX: This is a hack for now. Need to assign this view variable
+            # properly. Currently, can't use `cast_to_fp8` since most of the
+            # information of `fp8_meta` is added once in `prepare_forward`
+            # context manager
+            self.weight_tensor.fp8_meta_view = self.fp8_meta
+        else:
+            self.weight_tensor = temp_weight
 
         if self.use_bias:
             self.bias_tensor = torch.empty(
@@ -635,16 +630,11 @@ class Linear(TransformerEngineBaseModule):
             wname = pname + "weight"
             bname = pname + "bias"
 
-            print("before parameter init")
-            wparam = Parameter(self.weight_tensor)
-            print("after parameter init")
-
             # TODO(ksivaman): Add indexing op to torch dispatcher for float8
             # self.register_parameter(
             #     wname, Parameter(self.weight_tensor[i * split_size : (i+1) * split_size])
             # )
-            self.register_parameter(wname, wparam)
-            print("after register param")
+            self.register_parameter(wname, Parameter(self.weight_tensor))
 
             set_tensor_model_parallel_attributes(
                 tensor=getattr(self, wname),
