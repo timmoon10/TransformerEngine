@@ -10,6 +10,12 @@ from .cpp_extensions import (
 from .fp8 import get_fp8_te_dtype
 import transformer_engine_extensions as tex
 
+
+from inspect import currentframe, getframeinfo
+def get_current_loc():
+    cf = currentframe()
+    return f"{getframeinfo(cf).filename}:{cf.f_back.f_lineno}"
+
 class Float8ConstrFunc(torch.autograd.Function):
     """
     A differentiable conversion between fp32 and fp8
@@ -98,8 +104,8 @@ class Float8Tensor(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
-        print(f"[Floa8Tensor Torch Dispatch] func: {func}\n func inplace: {func._schema.is_mutable}\n mutable args: {[a.is_out for a in func._schema.arguments]}")
-        print(f"{[a.is_out for a in func._schema.arguments]}")
+        print(f"{get_current_loc()}", f"[Floa8Tensor Torch Dispatch] func: {func}\n func inplace: {func._schema.is_mutable}\n mutable args: {[a.is_out for a in func._schema.arguments]}")
+        print(f"{get_current_loc()}", f"{[a.is_out for a in func._schema.arguments]}")
 
         def maybe_unwrap(t):
             if isinstance(t, Float8Tensor):
@@ -150,7 +156,6 @@ class Float8Tensor(torch.Tensor):
                 tex.FP8FwdTensors.GEMM1_WEIGHT,
                 fp8_dtype_forward,
             )
-
             # This is an inplace addition op, so nothing to return
             return None
 

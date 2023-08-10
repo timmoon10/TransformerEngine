@@ -48,6 +48,11 @@ from ..jit import no_torch_dynamo
 from ..float8_tensor import Float8Tensor
 from ..float8_utils import E4M3, tensor_to_scale
 
+from inspect import currentframe, getframeinfo
+def get_current_loc():
+    cf = currentframe()
+    return f"{getframeinfo(cf).filename}:{cf.f_back.f_lineno}"
+
 __all__ = ["Linear"]
 
 
@@ -141,16 +146,23 @@ class _Linear(torch.autograd.Function):
 
             if update_fp8_weights:
                 if is_grad_enabled:
-                    weight_t_fp8 = weight.transpose(0, 1)
+                    # weight_t_fp8 = weight.transpose(0, 1)
+                    weight_t_fp8._data = weight._data.transpose(0,1).detach().clone()
+                    weight_t_fp8._scale = weight._scale.detach().clone()
+                    weight_t_fp8._flavor = weight._flavor
+                    # Also add the view to `fp8_meta` object
+                    weight_t_fp8.fp8_meta_view = weight.fp8_meta_view
+
+                    assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
                 else:
                     weight_t_fp8 = None
                     # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
-                    weight_fp8._data = cast_to_fp8(
-                        weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward,
-                    )
+                    # weight_fp8._data = cast_to_fp8(
+                    #     weight,
+                    #     fp8_meta["scaling_fwd"],
+                    #     tex.FP8FwdTensors.GEMM1_WEIGHT,
+                    #     fp8_dtype_forward,
+                    # )
 
             if ub_split_rs:
                 ub_obj_projout = get_ub("proj_fprop")
@@ -223,6 +235,7 @@ class _Linear(torch.autograd.Function):
 
         if is_grad_enabled:
             fp8_wgrad = fp8 and not fp8_meta["recipe"].override_linear_precision.wgrad
+            assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (before save for bwd)"
             ctx.save_for_backward(
                 inputmat_no_fp8 if weight.requires_grad and not fp8_wgrad else None,
                 inputmat_t if weight.requires_grad and fp8_wgrad else None,
@@ -271,6 +284,7 @@ class _Linear(torch.autograd.Function):
                 weight_t_fp8,
                 fwd_scale_inverses,
             ) = ctx.saved_tensors
+            assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (after restore in bwd)"
 
             if ctx.ub_split_ag:
                 tp_world_size = get_distributed_world_size(ctx.tp_group)
@@ -321,21 +335,25 @@ class _Linear(torch.autograd.Function):
 
             if ctx.requires_dgrad:
                 if ctx.fp8:
-                    dgrad = fp8_gemm(
-                        weight_t_fp8._data,
-                        fwd_scale_inverses,
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward,
-                        grad_output_c,
-                        ctx.fp8_meta["scaling_bwd"].scale_inv,
-                        tex.FP8BwdTensors.GRAD_OUTPUT1,
-                        fp8_dtype_backward,
-                        ctx.activation_dtype,
-                        get_workspace(),
-                        use_split_accumulator=_2X_ACC_DGRAD,
-                        ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ctx.ub_split_ag else None,
-                        ub=ctx.ub_obj_gradout if ctx.ub_split_ag else None,
-                    )
+                    try:
+                        dgrad = fp8_gemm(
+                            weight_t_fp8._data,
+                            fwd_scale_inverses,
+                            tex.FP8FwdTensors.GEMM1_WEIGHT,
+                            fp8_dtype_forward,
+                            grad_output_c,
+                            ctx.fp8_meta["scaling_bwd"].scale_inv,
+                            tex.FP8BwdTensors.GRAD_OUTPUT1,
+                            fp8_dtype_backward,
+                            ctx.activation_dtype,
+                            get_workspace(),
+                            use_split_accumulator=_2X_ACC_DGRAD,
+                            ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ctx.ub_split_ag else None,
+                            ub=ctx.ub_obj_gradout if ctx.ub_split_ag else None,
+                        )
+                    except:
+                        import pdb; pdb.set_trace()
+                        print(weight_t_fp8)
                 else:
                     dgrad, _, _ = gemm(
                         weight,
