@@ -528,7 +528,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         self.fp8_calibration = is_fp8_calibration()
         self.fp8_meta["fp8_checkpoint"] = self.fp8 or self.fp8_calibration
 
-        if self.fp8 or self.fp8_calibration or self.primary_weights_in_fp8:
+        if self.fp8 or self.fp8_calibration:
             # FP8 init has already been run and recipe is the same, don't do anything.
             if self.fp8_initialized and get_fp8_recipe() == self.fp8_meta["recipe"]:
                 return

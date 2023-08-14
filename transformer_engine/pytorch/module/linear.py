@@ -552,8 +552,6 @@ class Linear(TransformerEngineBaseModule):
         self.ub_split_rs = ub_split_rs
         self.ub_split_ag = ub_split_ag
 
-        self.primary_weights_in_fp8 = primary_weights_in_fp8
-
         if ub_split_rs or ub_split_ag:
             assert (
                 tex.userbuf_comm_available()
