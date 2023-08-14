@@ -85,7 +85,6 @@ class _Linear(torch.autograd.Function):
         ub_split_rs: bool,
         ub_split_ag: bool,
     ) -> torch.Tensor:
-        print(f"is_first_microbatch {is_first_microbatch}")
         # Make sure input dimensions are compatible
         in_features = weight.shape[-1]
         assert inp.shape[-1] == in_features, "GEMM not possible"
@@ -335,25 +334,21 @@ class _Linear(torch.autograd.Function):
 
             if ctx.requires_dgrad:
                 if ctx.fp8:
-                    try:
-                        dgrad = fp8_gemm(
-                            weight_t_fp8._data,
-                            fwd_scale_inverses,
-                            tex.FP8FwdTensors.GEMM1_WEIGHT,
-                            fp8_dtype_forward,
-                            grad_output_c,
-                            ctx.fp8_meta["scaling_bwd"].scale_inv,
-                            tex.FP8BwdTensors.GRAD_OUTPUT1,
-                            fp8_dtype_backward,
-                            ctx.activation_dtype,
-                            get_workspace(),
-                            use_split_accumulator=_2X_ACC_DGRAD,
-                            ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ctx.ub_split_ag else None,
-                            ub=ctx.ub_obj_gradout if ctx.ub_split_ag else None,
-                        )
-                    except:
-                        import pdb; pdb.set_trace()
-                        print(weight_t_fp8)
+                    dgrad = fp8_gemm(
+                        weight_t_fp8._data,
+                        fwd_scale_inverses,
+                        tex.FP8FwdTensors.GEMM1_WEIGHT,
+                        fp8_dtype_forward,
+                        grad_output_c,
+                        ctx.fp8_meta["scaling_bwd"].scale_inv,
+                        tex.FP8BwdTensors.GRAD_OUTPUT1,
+                        fp8_dtype_backward,
+                        ctx.activation_dtype,
+                        get_workspace(),
+                        use_split_accumulator=_2X_ACC_DGRAD,
+                        ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ctx.ub_split_ag else None,
+                        ub=ctx.ub_obj_gradout if ctx.ub_split_ag else None,
+                    )
                 else:
                     dgrad, _, _ = gemm(
                         weight,
@@ -557,6 +552,8 @@ class Linear(TransformerEngineBaseModule):
         self.ub_split_rs = ub_split_rs
         self.ub_split_ag = ub_split_ag
 
+        self.primary_weights_in_fp8 = primary_weights_in_fp8
+
         if ub_split_rs or ub_split_ag:
             assert (
                 tex.userbuf_comm_available()
@@ -602,13 +599,25 @@ class Linear(TransformerEngineBaseModule):
 
         if primary_weights_in_fp8 == True:
             print("assigning weights in fp8")
+            self.fp8_init()
+            self.fp8_meta["update_amax_and_scale_fwd"] = True
             # Assign the correct scale to the `fp8_meta` dictionary
             # self.fp8_meta["scaling_fwd"][1] = tensor_to_scale(temp_weight, E4M3)
             # TODO(ksivaman): Remove hardcoded fp8 weight and hardcoded FP8 flavor.
-            self.weight_tensor = Float8Tensor.from_float32(
-                temp_weight,
-                tensor_to_scale(temp_weight, E4M3),
-                E4M3,
+            # self.weight_tensor = Float8Tensor.from_float32(
+            #     temp_weight,
+            #     tensor_to_scale(temp_weight, E4M3),
+            #     E4M3,
+            # )
+            self.weight_tensor = Float8Tensor(
+                data = cast_to_fp8(
+                    temp_weight,
+                    self.fp8_meta["scaling_fwd"],
+                    tex.FP8FwdTensors.GEMM1_WEIGHT,
+                    tex.DType.kFloat8E4M3,
+                ),
+                scale = self.fp8_meta['scaling_fwd'].scale[1],
+                flavor = E4M3
             )
 
             # XXX: How to do update the fp8_meta dictionary with this info

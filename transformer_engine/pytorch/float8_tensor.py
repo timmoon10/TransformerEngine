@@ -25,7 +25,14 @@ class Float8ConstrFunc(torch.autograd.Function):
     def forward(ctx, tensor, scale: float=None, flavor=E4M3):
         if isinstance(tensor, Float8Tensor):
             ctx.inp_is_float8 = True
-            return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / tensor._scale
+            # return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / tensor._scale
+            # TODO (sudhakars): This needs to be a reference to the exact scale
+            # value. This is not the case currently because internally the
+            # scale factor calculation returns a new tensor for
+            # `fp8_meta["scaling_fwd"].scaling` and doesn't update the existing
+            # tensor in place
+            scale = tensor.fp8_meta_view['scaling_fwd'].scale[1]
+            return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / scale
         else:
             ctx.inp_is_float8 = False
             tensor_scaled = tensor * scale
@@ -106,6 +113,7 @@ class Float8Tensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
         print(f"{get_current_loc()}", f"[Floa8Tensor Torch Dispatch] func: {func}\n func inplace: {func._schema.is_mutable}\n mutable args: {[a.is_out for a in func._schema.arguments]}")
         print(f"{get_current_loc()}", f"{[a.is_out for a in func._schema.arguments]}")
+        print(f"{get_current_loc()}", f"{[type(a) for a in args]}")
 
         def maybe_unwrap(t):
             if isinstance(t, Float8Tensor):
@@ -116,6 +124,26 @@ class Float8Tensor(torch.Tensor):
             if not isinstance(t, Float8Tensor):
                 return Float8Tensor.from_float32(t, tensor_to_scale(t, E4M3), E4M3)
             return t
+
+        if func is aten.copy_.default:
+            assert isinstance(args[0], Float8Tensor) and \
+                isinstance(args[1], torch.Tensor), \
+                "recheck the input types for the tensor copy " \
+                "operation"
+
+            fp8_dtype_forward = get_fp8_te_dtype(
+                args[0].fp8_meta_view["recipe"], fprop_tensor=True
+            )
+
+            args[0]._data = cast_to_fp8(
+                args[1],
+                args[0].fp8_meta_view["scaling_fwd"],
+                tex.FP8FwdTensors.GEMM1_WEIGHT,
+                fp8_dtype_forward,
+            )
+            # This is an inplace copy op, so nothing to return
+            return None
+
 
         # override addition so we can add e5m2 gradients
         if func is aten.add_.Tensor:
@@ -160,22 +188,23 @@ class Float8Tensor(torch.Tensor):
             return None
 
         if func == aten.slice.Tensor:
-            print([type(a) for a in args])
-            original_fp8_tensor = args[0]
-            args = (args[0]._data,) + args[1:]
-            out = func(*args, **kwargs)
+            raise AssertionError("Slice operation on Float8Tensor is unsupported!")
+            # print([type(a) for a in args])
+            # original_fp8_tensor = args[0]
+            # args = (args[0]._data,) + args[1:]
+            # out = func(*args, **kwargs)
 
-            # TODO: The scale should be for this slice of the tensor and not the
-            # same as the original tensor
-            out = Float8Tensor(
-                out,
-                original_fp8_tensor._scale.detach().clone(),
-                original_fp8_tensor._flavor
-            )
+            # # TODO: The scale should be for this slice of the tensor and not the
+            # # same as the original tensor
+            # out = Float8Tensor.from_float32(
+            #     out,
+            #     tensor_to_scale(out, E4M3),
+            #     E4M3
+            # )
 
-            # Also add the view to `fp8_meta` object
-            if hasattr(original_fp8_tensor, "fp8_meta_view"):
-                out.fp8_meta_view = original_fp8_tensor.fp8_meta_view
+            # # Also add the view to `fp8_meta` object
+            # if hasattr(original_fp8_tensor, "fp8_meta_view"):
+            #     out.fp8_meta_view = original_fp8_tensor.fp8_meta_view
 
             return out
 
@@ -183,7 +212,7 @@ class Float8Tensor(torch.Tensor):
             original_fp8_tensor = args[0]
             out = Float8Tensor(
                 original_fp8_tensor._data.transpose(0,1).detach().clone(),
-                original_fp8_tensor._scale.detach().clone(),
+                original_fp8_tensor._scale,
                 original_fp8_tensor._flavor
             )
             # Also add the view to `fp8_meta` object
