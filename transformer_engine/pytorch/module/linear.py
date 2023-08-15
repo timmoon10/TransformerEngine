@@ -64,7 +64,7 @@ class _Linear(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        weight: torch.Tensor,
+        weight: Union[Float8Tensor, torch.Tensor],
         weight_fp8: Union[Float8Tensor, None],
         weight_t_fp8: Union[Float8Tensor, None],
         inp: torch.Tensor,
@@ -84,6 +84,7 @@ class _Linear(torch.autograd.Function):
         is_grad_enabled: bool,
         ub_split_rs: bool,
         ub_split_ag: bool,
+        primary_weights_in_fp8: bool,
     ) -> torch.Tensor:
         # Make sure input dimensions are compatible
         in_features = weight.shape[-1]
@@ -145,23 +146,35 @@ class _Linear(torch.autograd.Function):
 
             if update_fp8_weights:
                 if is_grad_enabled:
-                    # weight_t_fp8 = weight.transpose(0, 1)
-                    weight_t_fp8._data = weight._data.transpose(0,1).detach().clone()
-                    weight_t_fp8._scale = weight._scale.detach().clone()
-                    weight_t_fp8._flavor = weight._flavor
-                    # Also add the view to `fp8_meta` object
-                    weight_t_fp8.fp8_meta_view = weight.fp8_meta_view
+                    if primary_weights_in_fp8:
+                        weight_fp8 = weight
+                        # weight_t_fp8 = weight.transpose(0, 1)
+                        weight_t_fp8._data = weight._data.transpose(0,1).detach().clone()
+                        weight_t_fp8._scale = weight._scale.detach().clone()
+                        weight_t_fp8._flavor = weight._flavor
+                        # Also add the view to `fp8_meta` object
+                        weight_t_fp8.fp8_meta_view = weight.fp8_meta_view
 
-                    assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
+                        assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
+                    else:
+                        fp8_cast_transpose_fused(
+                        weight,
+                        fp8_meta["scaling_fwd"],
+                        tex.FP8FwdTensors.GEMM1_WEIGHT,
+                        fp8_dtype_forward,
+                        cast_out=weight_fp8._data,
+                        transpose_out=weight_t_fp8._data,
+                    )
                 else:
                     weight_t_fp8 = None
-                    # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
-                    # weight_fp8._data = cast_to_fp8(
-                    #     weight,
-                    #     fp8_meta["scaling_fwd"],
-                    #     tex.FP8FwdTensors.GEMM1_WEIGHT,
-                    #     fp8_dtype_forward,
-                    # )
+                    if not primary_weights_in_fp8:
+                        # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
+                        weight_fp8._data = cast_to_fp8(
+                            weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_WEIGHT,
+                            fp8_dtype_forward,
+                        )
 
             if ub_split_rs:
                 ub_obj_projout = get_ub("proj_fprop")
@@ -176,7 +189,7 @@ class _Linear(torch.autograd.Function):
                 out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
 
             _ = fp8_gemm(
-                weight._data,
+                weight_fp8._data,
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM1_WEIGHT,
                 fp8_dtype_forward,
@@ -444,6 +457,7 @@ class _Linear(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -552,6 +566,8 @@ class Linear(TransformerEngineBaseModule):
         self.ub_split_rs = ub_split_rs
         self.ub_split_ag = ub_split_ag
 
+        self.primary_weights_in_fp8 = primary_weights_in_fp8
+
         if ub_split_rs or ub_split_ag:
             assert (
                 tex.userbuf_comm_available()
@@ -595,7 +611,7 @@ class Linear(TransformerEngineBaseModule):
             stride=1,
         )
 
-        if primary_weights_in_fp8 == True:
+        if self.primary_weights_in_fp8:
             print("assigning weights in fp8")
             self.fp8_init()
             self.fp8_meta["update_amax_and_scale_fwd"] = True
@@ -656,10 +672,12 @@ class Linear(TransformerEngineBaseModule):
             bname = pname + "bias"
 
             # TODO(ksivaman): Add indexing op to torch dispatcher for float8
-            # self.register_parameter(
-            #     wname, Parameter(self.weight_tensor[i * split_size : (i+1) * split_size])
-            # )
-            self.register_parameter(wname, Parameter(self.weight_tensor))
+            if self.primary_weights_in_fp8:
+                self.register_parameter(wname, Parameter(self.weight_tensor))
+            else:
+                self.register_parameter(
+                    wname, Parameter(self.weight_tensor[i * split_size : (i+1) * split_size])
+                )
 
             set_tensor_model_parallel_attributes(
                 tensor=getattr(self, wname),
@@ -800,6 +818,7 @@ class Linear(TransformerEngineBaseModule):
                 torch.is_grad_enabled(),
                 self.ub_split_rs,
                 self.ub_split_ag,
+                self.primary_weights_in_fp8,
             )
             out = linear_fn(*args)
 

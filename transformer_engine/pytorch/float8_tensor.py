@@ -25,14 +25,14 @@ class Float8ConstrFunc(torch.autograd.Function):
     def forward(ctx, tensor, scale: float=None, flavor=E4M3):
         if isinstance(tensor, Float8Tensor):
             ctx.inp_is_float8 = True
-            # return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / tensor._scale
+            return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / tensor._scale
             # TODO (sudhakars): This needs to be a reference to the exact scale
             # value. This is not the case currently because internally the
             # scale factor calculation returns a new tensor for
             # `fp8_meta["scaling_fwd"].scaling` and doesn't update the existing
             # tensor in place
-            scale = tensor.fp8_meta_view['scaling_fwd'].scale[1]
-            return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / scale
+            # scale = tensor.fp8_meta_view['scaling_fwd'].scale[1]
+            # return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / scale
         else:
             ctx.inp_is_float8 = False
             tensor_scaled = tensor * scale
