@@ -372,6 +372,11 @@ class FP8GlobalStateManager:
         fp8_group: Optional[dist_group_type] = None,
     ) -> None:
         """Set state and tracking variables for entry into FP8 region."""
+        if cls.FP8_AUTOCAST_DEPTH == 0:
+            if callable(cls.amax_forward_global_reduce_func):
+                cls.amax_reduce_handle_fwd = cls.amax_forward_global_reduce_func() # pylint: disable=not-callable
+            cls.delete_key_from_amax_buffer(forward=True)
+
         cls.FP8_ENABLED = enabled
         cls.FP8_CALIBRATION = calibrating
         cls.FP8_RECIPE = get_default_fp8_recipe() if fp8_recipe is None else fp8_recipe
@@ -390,11 +395,6 @@ class FP8GlobalStateManager:
     def fp8_autocast_exit(cls):
         """Set state and tracking variables for exit from FP8 region."""
         cls.FP8_AUTOCAST_DEPTH -= 1
-
-        if cls.FP8_AUTOCAST_DEPTH == 0:
-            if callable(cls.amax_forward_global_reduce_func):
-                cls.amax_reduce_handle_fwd = cls.amax_forward_global_reduce_func() # pylint: disable=not-callable
-            cls.delete_key_from_amax_buffer(forward=True)
 
     @classmethod
     def copy_forward_fp8_meta_tensors_for_recompute(cls, fp8_meta: Dict[str, Any]) -> None:
