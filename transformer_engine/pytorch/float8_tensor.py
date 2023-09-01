@@ -6,9 +6,11 @@ c10d = torch.ops.c10d
 
 from .cpp_extensions import (
     cast_to_fp8,
+    cast_from_fp8,
 )
 from .fp8 import get_fp8_te_dtype
 import transformer_engine_extensions as tex
+from transformer_engine.pytorch.constants import TE_DType
 
 
 from inspect import currentframe, getframeinfo
@@ -25,14 +27,14 @@ class Float8ConstrFunc(torch.autograd.Function):
     def forward(ctx, tensor, scale: float=None, flavor=E4M3):
         if isinstance(tensor, Float8Tensor):
             ctx.inp_is_float8 = True
-            return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / tensor._scale
+            # return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / tensor._scale
             # TODO (sudhakars): This needs to be a reference to the exact scale
             # value. This is not the case currently because internally the
             # scale factor calculation returns a new tensor for
             # `fp8_meta["scaling_fwd"].scaling` and doesn't update the existing
             # tensor in place
-            # scale = tensor.fp8_meta_view['scaling_fwd'].scale[1]
-            # return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / scale
+            scale = tensor.fp8_meta_view['scaling_fwd'].scale[1]
+            return torch.ops.aten.float8_to_float32(tensor._data, tensor._flavor) / scale
         else:
             ctx.inp_is_float8 = False
             tensor_scaled = tensor * scale
@@ -96,11 +98,40 @@ class Float8Tensor(torch.Tensor):
     def from_float32(cls, tensor, scale, flavor):
         return Float8ConstrFunc.apply(tensor, scale, flavor)
 
-    def to_float32(self):
-        return Float8ConstrFunc.apply(self)
+    def upcast_from_fp8(self):
+        # print(Float8ConstrFunc.apply(self))
+        # For now, we need to print the weights and for printing weights, it
+        # makes sense to use `fprop_tensor=True`
+        fp8_dtype = get_fp8_te_dtype(
+                self.fp8_meta_view["recipe"], fprop_tensor=True
+            )
+        assert self.dtype in TE_DType, ("Upcasting from FP8 only for supported "
+                                        "dtypes in Transformer Engine")
+
+        return cast_from_fp8(
+            self._data,
+            self.fp8_meta_view["scaling_fwd"],
+            tex.FP8FwdTensors.GEMM1_WEIGHT,
+            fp8_dtype,
+            TE_DType[self.dtype],
+        )
+
+    @classmethod
+    def cast_to_fp8(cls, fp8_tensor, tensor_to_cast):
+        # NOTE: For now, we're casting just weights
+        fp8_dtype_forward = get_fp8_te_dtype(
+                fp8_tensor.fp8_meta_view["recipe"], fprop_tensor=True
+            )
+
+        fp8_tensor._data = cast_to_fp8(
+                tensor_to_cast,
+                fp8_tensor.fp8_meta_view["scaling_fwd"],
+                tex.FP8FwdTensors.GEMM1_WEIGHT,
+                fp8_dtype_forward,
+            )
 
     def __repr__(self):
-        return f"Float8Tensor(flavor={self._flavor}, scale={self._scale}, as_float32={self.to_float32()}"
+        return f"Float8Tensor(flavor={self._flavor}, scale={self._scale}, as_float32={self.upcast_from_fp8()}"
 
     @classmethod
     def update_inplace_fp8_tensor(cls, t, u):
@@ -117,7 +148,7 @@ class Float8Tensor(torch.Tensor):
 
         def maybe_unwrap(t):
             if isinstance(t, Float8Tensor):
-                return t.to_float32()
+                return t.upcast_from_fp8()
             return t
 
         def maybe_wrap(t):
@@ -125,67 +156,96 @@ class Float8Tensor(torch.Tensor):
                 return Float8Tensor.from_float32(t, tensor_to_scale(t, E4M3), E4M3)
             return t
 
+        def maybe_wrap_and_update_inplace(arg, new_arg, schema_arg):
+            if(
+                isinstance(arg, Float8Tensor) and
+                isinstance(new_arg, torch.Tensor) and
+                hasattr(schema_arg, 'alias_info') and
+                hasattr(schema_arg.alias_info, 'is_write') and
+                schema_arg.alias_info.is_write
+            ):
+                Float8Tensor.cast_to_fp8(arg, new_arg)
+
         if func is aten.copy_.default:
             assert isinstance(args[0], Float8Tensor) and \
                 isinstance(args[1], torch.Tensor), \
                 "recheck the input types for the tensor copy " \
                 "operation"
-
             fp8_dtype_forward = get_fp8_te_dtype(
                 args[0].fp8_meta_view["recipe"], fprop_tensor=True
             )
 
             args[0]._data = cast_to_fp8(
-                args[1],
-                args[0].fp8_meta_view["scaling_fwd"],
-                tex.FP8FwdTensors.GEMM1_WEIGHT,
-                fp8_dtype_forward,
-            )
+                    args[1],
+                    args[0].fp8_meta_view["scaling_fwd"],
+                    tex.FP8FwdTensors.GEMM1_WEIGHT,
+                    fp8_dtype_forward,
+                )
+
             # This is an inplace copy op, so nothing to return
             return None
 
+        if func._schema.is_mutable:
+            # import pdb; pdb.set_trace()
+            new_args = tree_map(maybe_unwrap, args)
+            new_kwargs = tree_map(maybe_unwrap, kwargs)
+            schema_args = func._schema.arguments
+            args_len = len(args)
+            kwargs_len = len(kwargs)
+            schema_args_len = len(schema_args)
+
+            out = super().__torch_dispatch__(func, types, new_args, new_kwargs)
+
+            for arg, new_arg, schema_arg in zip(args, new_args, schema_args):
+                maybe_wrap_and_update_inplace(arg, new_arg, schema_arg)
+
+            for kwarg, new_kwarg, schema_arg in zip(kwargs, new_kwargs, schema_args[args_len:]):
+                assert kwarg == new_kwarg == schema_arg.name, "name of the kw argument should match"
+                maybe_wrap_and_update_inplace(kwargs[kwarg], new_kwargs[new_kwarg], schema_arg)
+
+            return None
 
         # override addition so we can add e5m2 gradients
-        if func is aten.add_.Tensor:
-            # NOTE: This check could fail if the input types are swapped.
-            #       Need to confirm that the optimizer does (weights + delta)
-            #       in that order (delta ~ grads).
-            assert isinstance(args[0], Float8Tensor) and \
-                    isinstance(args[1], torch.Tensor), \
-                    "recheck the input types for the tensor add " \
-                    "operation"
+        # if func is aten.add_.Tensor:
+        #     # NOTE: This check could fail if the input types are swapped.
+        #     #       Need to confirm that the optimizer does (weights + delta)
+        #     #       in that order (delta ~ grads).
+        #     assert isinstance(args[0], Float8Tensor) and \
+        #             isinstance(args[1], torch.Tensor), \
+        #             "recheck the input types for the tensor add " \
+        #             "operation"
+        #     import
+        #     # For now, doing this only for FP32, but this should be done based
+        #     # on the types of the `delta` (grads tensor)
+        #     weights_fp32 = args[0].upcast_from_fp8()
+        #     new_weights = weights_fp32 + args[1]
 
-            # For now, doing this only for FP32, but this should be done based
-            # on the types of the `delta` (grads tensor)
-            weights_fp32 = args[0].to_float32()
-            new_weights = weights_fp32 + args[1]
+        #     ## Method 1: Convert the higher precision tensor to FP8 using
+        #     ##           PoC's methods. This doesn't update the amax
+        #     ##           history / scales.
+        #     # # Convert the weights back to Float8Tensor
+        #     # res = Float8Tensor.from_float32(
+        #     #     new_weights,
+        #     #     tensor_to_scale(new_weights, E4M3),
+        #     #     E4M3
+        #     # )
+        #     # # Need to update the FP8 weights inplace with the new data/scale
+        #     # Float8Tensor.update_inplace_fp8_tensor(args[0], res)
 
-            ## Method 1: Convert the higher precision tensor to FP8 using
-            ##           PoC's methods. This doesn't update the amax
-            ##           history / scales.
-            # # Convert the weights back to Float8Tensor
-            # res = Float8Tensor.from_float32(
-            #     new_weights,
-            #     tensor_to_scale(new_weights, E4M3),
-            #     E4M3
-            # )
-            # # Need to update the FP8 weights inplace with the new data/scale
-            # Float8Tensor.update_inplace_fp8_tensor(args[0], res)
+        #     ## Method 2: Convert the higher precision tensor to FP8 using
+        #     ##           TE's native `cast_to_fp8` function
+        #     fp8_dtype_forward = get_fp8_te_dtype(
+        #         args[0].fp8_meta_view["recipe"], fprop_tensor=True
+        #     )
 
-            ## Method 2: Convert the higher precision tensor to FP8 using
-            ##           TE's native `cast_to_fp8` function
-            fp8_dtype_forward = get_fp8_te_dtype(
-                args[0].fp8_meta_view["recipe"], fprop_tensor=True
-            )
-
-            args[0]._data = cast_to_fp8(
-                new_weights,
-                args[0].fp8_meta_view["scaling_fwd"],
-                tex.FP8FwdTensors.GEMM1_WEIGHT,
-                fp8_dtype_forward,
-            )
-            # This is an inplace addition op, so nothing to return
-            return None
+        #     args[0]._data = cast_to_fp8(
+        #         new_weights,
+        #         args[0].fp8_meta_view["scaling_fwd"],
+        #         tex.FP8FwdTensors.GEMM1_WEIGHT,
+        #         fp8_dtype_forward,
+        #     )
+        #     # This is an inplace addition op, so nothing to return
+        #     return None
 
         if func == aten.slice.Tensor:
             raise AssertionError("Slice operation on Float8Tensor is unsupported!")
