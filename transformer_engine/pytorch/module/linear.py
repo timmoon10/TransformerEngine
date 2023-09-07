@@ -148,12 +148,13 @@ class _Linear(torch.autograd.Function):
                 if is_grad_enabled:
                     if primary_weights_in_fp8:
                         weight_fp8 = weight
-                        # weight_t_fp8 = weight.transpose(0, 1)
-                        weight_t_fp8._data = weight._data.transpose(0,1).detach().clone()
-                        weight_t_fp8._scale = weight._scale.detach().clone()
-                        weight_t_fp8._flavor = weight._flavor
-                        # Also add the view to `fp8_meta` object
-                        weight_t_fp8.fp8_meta_view = weight.fp8_meta_view
+                        #NOTE (sudhakars): Handle this function in `torch_dispatch later`
+                        weight_t_fp8 = weight.transpose()
+                        # weight_t_fp8._data = weight._data.transpose(0,1).detach().clone()
+                        # weight_t_fp8._scale = weight._scale.detach().clone()
+                        # weight_t_fp8._flavor = weight._flavor
+                        # # Also add the view to `fp8_meta` object
+                        # weight_t_fp8.fp8_meta_view = weight.fp8_meta_view
 
                         assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
                     else:
@@ -166,6 +167,7 @@ class _Linear(torch.autograd.Function):
                         transpose_out=weight_t_fp8._data,
                     )
                 else:
+                    weight_fp8 = weight
                     weight_t_fp8 = None
                     if not primary_weights_in_fp8:
                         # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
@@ -549,7 +551,7 @@ class Linear(TransformerEngineBaseModule):
         parameters_split: Optional[Tuple[str, ...]] = None,
         ub_split_rs: bool = False,
         ub_split_ag: bool = False,
-        primary_weights_in_fp8 = False,
+        primary_weights_in_fp8 = True,
         device: Union[torch.device, str] = "cuda",
     ) -> None:
         super().__init__()
@@ -637,7 +639,8 @@ class Linear(TransformerEngineBaseModule):
                     tex.DType.kFloat8E4M3,
                 ),
                 scale = self.fp8_meta['scaling_fwd'].scale[1],
-                flavor = E4M3
+                flavor = E4M3,
+                fp8_meta_view=self.fp8_meta,
             )
 
             # XXX: How to do update the fp8_meta dictionary with this info
@@ -645,7 +648,7 @@ class Linear(TransformerEngineBaseModule):
             # properly. Currently, can't use `cast_to_fp8` since most of the
             # information of `fp8_meta` is added once in `prepare_forward`
             # context manager
-            self.weight_tensor.fp8_meta_view = self.fp8_meta
+            # self.weight_tensor.fp8_meta_view = self.fp8_meta
         else:
             self.weight_tensor = temp_weight
 
@@ -719,7 +722,7 @@ class Linear(TransformerEngineBaseModule):
         `is_first_microbatch` is not `None`) or return empty fp8 weight
         tensors (if `is_first_microbatch is None`)
         """
-        if not self.fp8:
+        if not self.fp8 or self.primary_weights_in_fp8:
             return [None, None]
 
         if is_first_microbatch is None:

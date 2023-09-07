@@ -573,7 +573,7 @@ def _fused_amax_and_scale_update(
         amax_history,
         amax_compute_algo,
     )
-    print("fp8.py: ", amax)
+    # print("fp8.py: ", amax)
 
     # Calculate new scaling factor.
     scale = _default_sf_compute(

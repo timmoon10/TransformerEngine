@@ -18,6 +18,21 @@ def get_current_loc():
     cf = currentframe()
     return f"{getframeinfo(cf).filename}:{cf.f_back.f_lineno}"
 
+class Float8DummyFunc(torch.autograd.Function):
+    """
+    A dummy function to create an autograd node
+    """
+    @staticmethod
+    def forward(ctx, tensor):
+
+        assert isinstance(tensor, Float8Tensor), ("Input can't be anything "
+                                                  "other than a Float8Tensor. ")
+        return torch.randn(1)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g
+
 class Float8ConstrFunc(torch.autograd.Function):
     """
     A differentiable conversion between fp32 and fp8
@@ -62,7 +77,7 @@ class Float8Tensor(torch.Tensor):
     * `_flavor`: either E4M3 or E5M2
     """
 
-    def __new__(cls, data, scale, flavor):
+    def __new__(cls, data, scale, flavor, fp8_meta_view=None, base_dtype=torch.float32):
         # This is a non-differentiable constructor!
         assert not data.requires_grad
         # TODO(future): make bits8 easier to work with and switch to using it
@@ -75,7 +90,7 @@ class Float8Tensor(torch.Tensor):
             data.size(),
             strides=data.stride(),
             storage_offset=data.storage_offset(),
-            dtype=torch.float32,
+            dtype=base_dtype,
             layout=data.layout,
             requires_grad=data.requires_grad,
             device=data.device,
@@ -92,19 +107,72 @@ class Float8Tensor(torch.Tensor):
         # for now, hardcoding it
         self._flavor = E4M3
 
+        self.fp8_meta_view = fp8_meta_view
+
         return self
 
-    @classmethod
-    def from_float32(cls, tensor, scale, flavor):
-        return Float8ConstrFunc.apply(tensor, scale, flavor)
+    def bfloat16(self):
+        # import pdb; pdb.set_trace()
+        if self.dtype is not torch.bfloat16:
+            converted_tensor = Float8Tensor(
+                data=self._data,
+                scale=self._scale,
+                flavor=self._flavor,
+                fp8_meta_view=self.fp8_meta_view,
+                base_dtype=torch.bfloat16
+            )
+        else:
+            converted_tensor = self
+        return converted_tensor
 
-    def upcast_from_fp8(self):
+    def transpose(self):
+        return Float8Tensor(
+            data=self._data.transpose(0,1).detach().clone(),
+            scale=self._scale.detach().clone(),
+            flavor=self._flavor,
+            base_dtype=self.dtype,
+            fp8_meta_view=self.fp8_meta_view
+        )
+
+    def cpu(self):
+        return self.upcast_from_fp8().cpu()
+
+    def clone(self):
+        return Float8Tensor(
+            data=self._data.clone(),
+            scale=self._scale.clone(),
+            flavor=self._flavor,
+            base_dtype=self.dtype,
+            fp8_meta_view=self.fp8_meta_view
+        )
+
+    def float(self):
+        higher_precision_tensor = self.upcast_from_fp8()
+        if higher_precision_tensor.dtype is not torch.float32:
+            higher_precision_tensor = higher_precision_tensor.float()
+
+        return higher_precision_tensor
+
+        #NOTE: Following is a generic implementation
+        # if self.dtype is not torch.float32:
+        #     converted_tensor = Float8Tensor(
+        #         data=self._data,
+        #         scale=self._scale,
+        #         flavor=self._flavor,
+        #         fp8_meta_view=self.fp8_meta_view,
+        #         base_dtype=torch.float32
+        #     )
+        # else:
+        #     converted_tensor = self
+        # return converted_tensor
+
+    def upcast_from_fp8(self, to_dtype=None):
         # print(Float8ConstrFunc.apply(self))
         # For now, we need to print the weights and for printing weights, it
         # makes sense to use `fprop_tensor=True`
         fp8_dtype = get_fp8_te_dtype(
                 self.fp8_meta_view["recipe"], fprop_tensor=True
-            )
+        )
         assert self.dtype in TE_DType, ("Upcasting from FP8 only for supported "
                                         "dtypes in Transformer Engine")
 
@@ -113,25 +181,37 @@ class Float8Tensor(torch.Tensor):
             self.fp8_meta_view["scaling_fwd"],
             tex.FP8FwdTensors.GEMM1_WEIGHT,
             fp8_dtype,
-            TE_DType[self.dtype],
+            to_dtype if to_dtype is not None else TE_DType[self.dtype],
         )
+
+    def to_float32(self):
+        return Float8ConstrFunc.apply(self)
+
+    def expand_as(self, unused):
+        # NOTE: A hack to create a dummy autograd node and then get the
+        # hook to `AccumulateGrad`
+        return Float8DummyFunc.apply(self)
+
+    def __repr__(self):
+        return f"Float8Tensor(flavor={self._flavor}, scale={self._scale}, as_float32={self.upcast_from_fp8()}"
 
     @classmethod
     def cast_to_fp8(cls, fp8_tensor, tensor_to_cast):
         # NOTE: For now, we're casting just weights
         fp8_dtype_forward = get_fp8_te_dtype(
                 fp8_tensor.fp8_meta_view["recipe"], fprop_tensor=True
-            )
+        )
 
         fp8_tensor._data = cast_to_fp8(
                 tensor_to_cast,
                 fp8_tensor.fp8_meta_view["scaling_fwd"],
                 tex.FP8FwdTensors.GEMM1_WEIGHT,
                 fp8_dtype_forward,
-            )
+        )
 
-    def __repr__(self):
-        return f"Float8Tensor(flavor={self._flavor}, scale={self._scale}, as_float32={self.upcast_from_fp8()}"
+    @classmethod
+    def from_float32(cls, tensor, scale, flavor):
+        return Float8ConstrFunc.apply(tensor, scale, flavor)
 
     @classmethod
     def update_inplace_fp8_tensor(cls, t, u):
@@ -153,10 +233,17 @@ class Float8Tensor(torch.Tensor):
 
         def maybe_wrap(t):
             if not isinstance(t, Float8Tensor):
+                raise AssertionError("This is problematic if the input tensor and output tensor are expected to behave almost similarly but since we're converting FP8 -> FP32/BF16 -> FP8, there's some inherent loss of info")
                 return Float8Tensor.from_float32(t, tensor_to_scale(t, E4M3), E4M3)
             return t
 
         def maybe_wrap_and_update_inplace(arg, new_arg, schema_arg):
+            """
+            This converts the higher precision tensor to FP8 in-place in the
+            sense that the original FP8 tensor's `_data` attribute gets updated.
+            The "scale" values are already updated/maintained in the
+            `fp8_meta_view` attr for FP8 tensor.
+            """
             if(
                 isinstance(arg, Float8Tensor) and
                 isinstance(new_arg, torch.Tensor) and
@@ -186,7 +273,7 @@ class Float8Tensor(torch.Tensor):
             return None
 
         if func._schema.is_mutable:
-            # import pdb; pdb.set_trace()
+            import pdb; pdb.set_trace()
             new_args = tree_map(maybe_unwrap, args)
             new_kwargs = tree_map(maybe_unwrap, kwargs)
             schema_args = func._schema.arguments
@@ -214,7 +301,7 @@ class Float8Tensor(torch.Tensor):
         #             isinstance(args[1], torch.Tensor), \
         #             "recheck the input types for the tensor add " \
         #             "operation"
-        #     import
+
         #     # For now, doing this only for FP32, but this should be done based
         #     # on the types of the `delta` (grads tensor)
         #     weights_fp32 = args[0].upcast_from_fp8()
@@ -280,6 +367,8 @@ class Float8Tensor(torch.Tensor):
                 out.fp8_meta_view = original_fp8_tensor.fp8_meta_view
             return out
 
+        # if func == aten.clone.default:
+
         if func == aten.detach.default:
 
             ## Method 1: cast args to fp32, then recast the `out` to fp8
@@ -306,12 +395,14 @@ class Float8Tensor(torch.Tensor):
             out = Float8Tensor(
                 original_fp8_tensor._data,
                 original_fp8_tensor._scale,
-                original_fp8_tensor._flavor
+                original_fp8_tensor._flavor,
+                original_fp8_tensor.fp8_meta_view,
+                original_fp8_tensor.dtype
             )
 
             # Also add the view to `fp8_meta` object
-            if hasattr(original_fp8_tensor, "fp8_meta_view"):
-                out.fp8_meta_view = original_fp8_tensor.fp8_meta_view
+            # if hasattr(original_fp8_tensor, "fp8_meta_view"):
+            #     out.fp8_meta_view = original_fp8_tensor.fp8_meta_view
 
             return out
 
