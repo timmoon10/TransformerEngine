@@ -43,6 +43,7 @@ from ..jit import no_torch_dynamo
 
 from ._common import _apply_normalization
 
+from ..float8_tensor import Float8Tensor
 
 __all__ = ["LayerNormLinear"]
 
@@ -83,6 +84,7 @@ class _LayerNormLinear(torch.autograd.Function):
         ub_bulk_dgrad: bool,
         ub_split_ag: bool,
         normalization: str,
+        primary_weights_in_fp8: bool,
     ) -> Union[Tuple[torch.Tensor, ...], torch.Tensor]:
         # Make sure input dimensions are compatible
         in_features = ln_weight.numel()
@@ -157,24 +159,33 @@ class _LayerNormLinear(torch.autograd.Function):
 
             if update_fp8_weights:
                 if is_grad_enabled:
-                    tex.fp8_cast_transpose_fused(
-                        weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward,
-                        cast_out=weight_fp8,
-                        transpose_out=weight_t_fp8,
-                    )
+                    if primary_weights_in_fp8:
+                        weight_fp8 = weight
+                        #NOTE (sudhakars): Handle this function in `torch_dispatch later`
+                        weight_t_fp8 = weight.transpose()
+                        assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
+                    else:
+                        tex.fp8_cast_transpose_fused(
+                            weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_WEIGHT,
+                            fp8_dtype_forward,
+                            cast_out=weight_fp8._data,
+                            transpose_out=weight_t_fp8._data,
+                        )
                 else:
                     weight_t_fp8 = None
-                    weight_fp8 = tex.cast_to_fp8(
-                        weight,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_WEIGHT,
-                        fp8_dtype_forward)
+                    if primary_weights_in_fp8:
+                        weight_fp8 = weight
+                    else:
+                        weight_fp8._data = tex.cast_to_fp8(
+                            weight,
+                            fp8_meta["scaling_fwd"],
+                            tex.FP8FwdTensors.GEMM1_WEIGHT,
+                            fp8_dtype_forward)
 
             out = tex.fp8_gemm(
-                weight_fp8,
+                weight_fp8._data,
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM1_WEIGHT,
                 fp8_dtype_forward,
@@ -342,7 +353,7 @@ class _LayerNormLinear(torch.autograd.Function):
 
                 # DGRAD: Evaluated unconditionally to feed into Linear backward
                 _ = tex.fp8_gemm(
-                    weight_t_fp8,
+                    weight_t_fp8._data,
                     fwd_scale_inverses,
                     tex.FP8FwdTensors.GEMM1_WEIGHT,
                     fp8_dtype_forward,
@@ -504,6 +515,7 @@ class _LayerNormLinear(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -612,6 +624,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
         ub_bulk_wgrad: bool = False,
         ub_bulk_dgrad: bool = False,
         ub_split_ag: bool = False,
+        primary_weights_in_fp8 = True,
         device: Union[torch.device, str] = "cuda",
     ) -> None:
         super().__init__()
@@ -639,6 +652,8 @@ class LayerNormLinear(TransformerEngineBaseModule):
         self.ub_bulk_wgrad = ub_bulk_wgrad
         self.ub_bulk_dgrad = ub_bulk_dgrad
         self.ub_split_ag = ub_split_ag
+
+        self.primary_weights_in_fp8 = primary_weights_in_fp8
 
         if ub_bulk_wgrad or ub_bulk_dgrad or ub_split_ag:
             assert (
@@ -683,17 +698,41 @@ class LayerNormLinear(TransformerEngineBaseModule):
             self.layer_norm_bias = None
         self.reset_layer_norm_parameters()
 
-        self.weight_tensor = torch.empty(
+        temp_weight = torch.empty(
             self.out_features, self.in_features,
             device=device, dtype=params_dtype)
 
         initialize_affine_weight_gpu(
-            self.weight_tensor,
+            temp_weight,
             init_method,
             get_rng_state_tracker,
             partition_dim=1 if self.parallel_mode == "row" else 0,
             stride=1,
         )
+
+        if self.primary_weights_in_fp8:
+            print("assigning weights in fp8")
+            self.fp8_init()
+            self.fp8_meta["update_amax_and_scale_fwd"] = True
+            # Assign the correct scale to the `fp8_meta` dictionary
+            # self.fp8_meta["scaling_fwd"][1] = tensor_to_scale(temp_weight, E4M3)
+            # TODO(ksivaman): Remove hardcoded fp8 weight and hardcoded FP8 flavor.
+            # self.weight_tensor = Float8Tensor.from_float32(
+            #     temp_weight,
+            #     tensor_to_scale(temp_weight, E4M3),
+            #     E4M3,
+            # )
+            self.weight_tensor = Float8Tensor(
+                data = tex.cast_to_fp8(
+                    temp_weight,
+                    self.fp8_meta["scaling_fwd"],
+                    tex.FP8FwdTensors.GEMM1_WEIGHT,
+                    tex.DType.kFloat8E4M3,
+                ),
+                fp8_meta_view=self.fp8_meta,
+            )
+        else:
+            self.weight_tensor = temp_weight
 
         if self.use_bias:
             self.bias_tensor = torch.empty(
@@ -722,9 +761,17 @@ class LayerNormLinear(TransformerEngineBaseModule):
             wname = pname + "weight"
             bname = pname + "bias"
 
-            self.register_parameter(
-                wname, Parameter(self.weight_tensor[i * split_size : (i+1) * split_size])
-            )
+            # NOTE(future): Figure out a way to support slicing when weights
+            # are of `Float8Tensor` class
+            if self.primary_weights_in_fp8:
+                assert len(parameters_split) == 1, ("Slicing operation is not "
+                                                    "supported in Float8Tensor "
+                                                    "class!")
+                self.register_parameter(wname, Parameter(self.weight_tensor))
+            else:
+                self.register_parameter(
+                    wname, Parameter(self.weight_tensor[i * split_size : (i+1) * split_size])
+                )
 
             set_tensor_model_parallel_attributes(
                 tensor=getattr(self, wname),
@@ -781,7 +828,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
         `is_first_microbatch` is not `None`) or return empty fp8 weight
         tensors (if `is_first_microbatch is None`)
         """
-        if not self.fp8:
+        if not self.fp8 or self.primary_weights_in_fp8:
             return [None, None]
 
         if is_first_microbatch is None:
@@ -890,6 +937,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
                 self.ub_bulk_dgrad,
                 self.ub_split_ag,
                 self.normalization,
+                self.primary_weights_in_fp8,
             )
             out = fwd_fn(*args)
 
