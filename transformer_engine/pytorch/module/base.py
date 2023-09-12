@@ -808,8 +808,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                         shape,
                         device=torch.cuda.current_device(),
                         dtype=torch.uint8,
-                    ),
-                    scale=None, flavor=None
+                    )
                 )
             )
 
@@ -820,8 +819,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                         shape[0],
                         device=torch.cuda.current_device(),
                         dtype=torch.uint8,
-                    ),
-                    scale=None, flavor=None
+                    )
                 )
             )
         return fp8_weight_tensors

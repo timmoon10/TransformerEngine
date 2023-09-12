@@ -545,7 +545,7 @@ class Linear(TransformerEngineBaseModule):
         parameters_split: Optional[Tuple[str, ...]] = None,
         ub_split_rs: bool = False,
         ub_split_ag: bool = False,
-        primary_weights_in_fp8 = True,
+        primary_weights_in_fp8: bool = True,
         device: Union[torch.device, str] = "cuda",
     ) -> None:
         super().__init__()
