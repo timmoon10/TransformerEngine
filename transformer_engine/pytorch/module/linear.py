@@ -617,14 +617,7 @@ class Linear(TransformerEngineBaseModule):
             print("assigning weights in fp8")
             self.fp8_init()
             self.fp8_meta["update_amax_and_scale_fwd"] = True
-            # Assign the correct scale to the `fp8_meta` dictionary
-            # self.fp8_meta["scaling_fwd"][1] = tensor_to_scale(temp_weight, E4M3)
-            # TODO(ksivaman): Remove hardcoded fp8 weight and hardcoded FP8 flavor.
-            # self.weight_tensor = Float8Tensor.from_float32(
-            #     temp_weight,
-            #     tensor_to_scale(temp_weight, E4M3),
-            #     E4M3,
-            # )
+
             self.weight_tensor = Float8Tensor(
                 data = cast_to_fp8(
                     temp_weight,
@@ -633,6 +626,7 @@ class Linear(TransformerEngineBaseModule):
                     tex.DType.kFloat8E4M3,
                 ),
                 fp8_meta_view=self.fp8_meta,
+                gemm_index=tex.FP8FwdTensors.GEMM1_WEIGHT,
             )
         else:
             self.weight_tensor = temp_weight

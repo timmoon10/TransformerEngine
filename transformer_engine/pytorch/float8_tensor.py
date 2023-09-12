@@ -76,7 +76,7 @@ class Float8Tensor(torch.Tensor):
     * `_flavor`: either E4M3 or E5M2
     """
 
-    def __new__(cls, data, fp8_meta_view=None, fake_dtype=torch.float32):
+    def __new__(cls, data, fp8_meta_view=None, gemm_index=1, fake_dtype=torch.float32):
         # This is a non-differentiable constructor!
         assert not data.requires_grad
 
@@ -95,6 +95,7 @@ class Float8Tensor(torch.Tensor):
         )
         self._data = data
         self.fp8_meta_view = fp8_meta_view
+        self.gemm_index = gemm_index
         return self
 
     @property
@@ -104,7 +105,7 @@ class Float8Tensor(torch.Tensor):
                                                 "module.")
         # NOTE: currently hardcoding the scale location, later switch to info
         # from the `fp8_recipe`.
-        return self.fp8_meta_view['scaling_fwd'].scale[1]
+        return self.fp8_meta_view['scaling_fwd'].scale[self.gemm_index]
 
     def _flavor(self):
         # NOTE: currently hardcoding the flavor but it should be derived from
@@ -116,6 +117,7 @@ class Float8Tensor(torch.Tensor):
             converted_tensor = Float8Tensor(
                 data=self._data,
                 fp8_meta_view=self.fp8_meta_view,
+                gemm_index=self.gemm_index,
                 fake_dtype=dtype
             )
         else:
@@ -140,6 +142,7 @@ class Float8Tensor(torch.Tensor):
         return Float8Tensor(
             data=self._data.transpose(0,1).detach().clone(),
             fp8_meta_view=self.fp8_meta_view,
+            gemm_index=self.gemm_index,
             fake_dtype=self.dtype
         )
 
@@ -149,8 +152,9 @@ class Float8Tensor(torch.Tensor):
     def clone(self):
         return Float8Tensor(
             data=self._data.detach().clone(),
+            fp8_meta_view=self.fp8_meta_view,
+            gemm_index=self.gemm_index,
             fake_dtype=self.dtype,
-            fp8_meta_view=self.fp8_meta_view
         )
 
     def upcast_from_fp8(self, to_dtype=None):
@@ -205,6 +209,7 @@ class Float8Tensor(torch.Tensor):
         if isinstance(t, Float8Tensor) and isinstance(u, Float8Tensor):
             t._data = u._data
             t.fp8_meta_view = u.fp8_meta_view
+            t.gemm_index = u.gemm_index
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
@@ -284,6 +289,7 @@ class Float8Tensor(torch.Tensor):
             out = Float8Tensor(
                 original_fp8_tensor._data.transpose(0,1).detach().clone(),
                 original_fp8_tensor.fp8_meta_view,
+                original_fp8_tensor.gemm_index,
                 original_fp8_tensor.fake_dtype
             )
             return out
@@ -300,6 +306,7 @@ class Float8Tensor(torch.Tensor):
             out = Float8Tensor(
                 original_fp8_tensor._data,
                 original_fp8_tensor.fp8_meta_view,
+                original_fp8_tensor.gemm_index,
                 original_fp8_tensor.dtype
             )
             return out
