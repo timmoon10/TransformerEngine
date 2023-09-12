@@ -157,8 +157,7 @@ class Float8Tensor(torch.Tensor):
             fake_dtype=self.dtype,
         )
 
-    def upcast_from_fp8(self, to_dtype=None):
-        # print(Float8ConstrFunc.apply(self))
+    def upcast_from_fp8(self):
         # For now, we need to print the weights and for printing weights, it
         # makes sense to use `fprop_tensor=True`
         fp8_dtype = get_fp8_te_dtype(
@@ -170,9 +169,9 @@ class Float8Tensor(torch.Tensor):
         return cast_from_fp8(
             self._data,
             self.fp8_meta_view["scaling_fwd"],
-            tex.FP8FwdTensors.GEMM1_WEIGHT,
+            self.gemm_index,
             fp8_dtype,
-            to_dtype if to_dtype is not None else TE_DType[self.dtype],
+            TE_DType[self.dtype],
         )
 
     def to_float32(self):
@@ -188,7 +187,8 @@ class Float8Tensor(torch.Tensor):
 
     @classmethod
     def cast_to_fp8(cls, fp8_tensor, tensor_to_cast):
-        # NOTE: For now, we're casting just weights
+        # NOTE: For now, we're casting just weights, so `fprop_tensor=True` is
+        # good.
         fp8_dtype_forward = get_fp8_te_dtype(
                 fp8_tensor.fp8_meta_view["recipe"], fprop_tensor=True
         )
@@ -196,7 +196,7 @@ class Float8Tensor(torch.Tensor):
         fp8_tensor._data = cast_to_fp8(
                 tensor_to_cast,
                 fp8_tensor.fp8_meta_view["scaling_fwd"],
-                tex.FP8FwdTensors.GEMM1_WEIGHT,
+                fp8_tensor.gemm_index,
                 fp8_dtype_forward,
         )
 
@@ -249,17 +249,8 @@ class Float8Tensor(torch.Tensor):
                 isinstance(args[1], torch.Tensor), \
                 "recheck the input types for the tensor copy " \
                 "operation"
-            fp8_dtype_forward = get_fp8_te_dtype(
-                args[0].fp8_meta_view["recipe"], fprop_tensor=True
-            )
 
-            args[0]._data = cast_to_fp8(
-                    args[1],
-                    args[0].fp8_meta_view["scaling_fwd"],
-                    tex.FP8FwdTensors.GEMM1_WEIGHT,
-                    fp8_dtype_forward,
-                )
-
+            Float8Tensor.cast_to_fp8(args[0], args[1])
             # This is an inplace copy op, so nothing to return
             return None
 
