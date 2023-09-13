@@ -194,12 +194,12 @@ class _LayerNormMLP(torch.autograd.Function):
                 if is_grad_enabled:
                     if primary_weights_in_fp8:
                         fc1_weight_fp8 = fc1_weight
-                        fc1_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc1_weight_fp8.gemm_index] = fc1_weight_fp8._scale_inv_cache
+                        fc1_weight_fp8.swap_scale_inv_with_fp8_meta()
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         fc1_weight_t_fp8 = fc1_weight_fp8.transpose()
 
                         fc2_weight_fp8 = fc2_weight
-                        fc2_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc2_weight_fp8.gemm_index] = fc2_weight_fp8._scale_inv_cache
+                        fc2_weight_fp8.swap_scale_inv_with_fp8_meta()
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         fc2_weight_t_fp8 = fc2_weight_fp8.transpose()
                     else:
@@ -226,9 +226,9 @@ class _LayerNormMLP(torch.autograd.Function):
 
                     if primary_weights_in_fp8:
                         fc1_weight_fp8 = fc1_weight
-                        fc1_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc1_weight_fp8.gemm_index] = fc1_weight_fp8._scale_inv_cache
+                        fc1_weight_fp8.swap_scale_inv_with_fp8_meta()
                         fc2_weight_fp8 = fc2_weight
-                        fc2_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc2_weight_fp8.gemm_index] = fc2_weight_fp8._scale_inv_cache
+                        fc2_weight_fp8.swap_scale_inv_with_fp8_meta()
                     else:
                         # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
                         fc1_weight_fp8._data = tex.cast_to_fp8(

@@ -119,10 +119,16 @@ class Float8Tensor(torch.Tensor):
         # from the `fp8_recipe`.
         return self.fp8_meta_view['scaling_fwd'].scale[self.gemm_index]
 
+    @property
     def _flavor(self):
         # NOTE: currently hardcoding the flavor but it should be derived from
         # the `fp8_meta_view` object
         return E4M3
+
+    def swap_scale_inv_with_fp8_meta(self):
+        latest_scale_inv = self.fp8_meta_view['scaling_fwd'].scale_inv[self.gemm_index]
+        self.fp8_meta_view['scaling_fwd'].scale_inv[self.gemm_index] = self._scale_inv_cache
+        self._scale_inv_cache = latest_scale_inv
 
     def to_fake_dtype(self, dtype):
         if self.dtype is not dtype:
