@@ -96,6 +96,14 @@ class Float8Tensor(torch.Tensor):
         self._data = data
         self.fp8_meta_view = fp8_meta_view
         self.gemm_index = gemm_index
+
+        # For now the only case, when `fp8_meta_view` is `None` is when empty
+        # `Float8Tensors` are initialized in the `get_fp8_weights_scratchpad`
+        # method in TE's layers.
+        if self.fp8_meta_view is not None:
+            self._scale_inv_cache = self.fp8_meta_view['scaling_fwd'].scale_inv[self.gemm_index]
+        else:
+            self._scale_inv_cache = None
         return self
 
     @property
@@ -174,12 +182,16 @@ class Float8Tensor(torch.Tensor):
             TE_DType[self.dtype],
         )
 
-    def to_float32(self):
-        return Float8ConstrFunc.apply(self)
+
+    # NOTE(sudhakars): This function isn't being used anymore. Remove it from
+    # here once verified that it's not needed anymore.
+    # def to_float32(self):
+    #     return Float8ConstrFunc.apply(self)
 
     def expand_as(self, unused):
         # NOTE: A hack to create a dummy autograd node and then get the
-        # hook to `AccumulateGrad`
+        # hook to `AccumulateGrad`. (sudhakars): need to add the actual
+        # `expand_as` functionality as well.
         return Float8DummyFunc.apply(self)
 
     def __repr__(self):
@@ -199,6 +211,11 @@ class Float8Tensor(torch.Tensor):
                 fp8_tensor.gemm_index,
                 fp8_dtype_forward,
         )
+
+        # Update the `_scale_inv` since we've updated the `_data` attr and
+        # in the next iteration, this will change the
+        fp8_tensor._scale_inv_cache = fp8_tensor.fp8_meta_view['scaling_fwd'].scale_inv[fp8_tensor.gemm_index]
+
 
     @classmethod
     def from_float32(cls, tensor, scale, flavor):

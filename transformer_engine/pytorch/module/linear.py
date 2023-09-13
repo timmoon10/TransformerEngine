@@ -147,6 +147,7 @@ class _Linear(torch.autograd.Function):
                 if is_grad_enabled:
                     if primary_weights_in_fp8:
                         weight_fp8 = weight
+                        weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[weight_fp8.gemm_index] = weight_fp8._scale_inv_cache
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         weight_t_fp8 = weight.transpose()
                         assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
@@ -163,6 +164,7 @@ class _Linear(torch.autograd.Function):
                     weight_t_fp8 = None
                     if primary_weights_in_fp8:
                         weight_fp8 = weight
+                        weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[weight_fp8.gemm_index] = weight_fp8._scale_inv_cache
                     else:
                         # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
                         weight_fp8._data = cast_to_fp8(
@@ -614,7 +616,6 @@ class Linear(TransformerEngineBaseModule):
         )
 
         if self.primary_weights_in_fp8:
-            print("assigning weights in fp8")
             self.fp8_init()
             self.fp8_meta["update_amax_and_scale_fwd"] = True
 
