@@ -104,6 +104,10 @@ class Float8Tensor(torch.Tensor):
             self._scale_inv_cache = self.fp8_meta_view['scaling_fwd'].scale_inv[self.gemm_index]
         else:
             self._scale_inv_cache = None
+
+        # Also saving the transpose of the underlying data as an optimization
+        # self._data_transpose = self._data.detach().clone().transpose(0,1)
+        self._transpose = None
         return self
 
     @property
@@ -146,13 +150,16 @@ class Float8Tensor(torch.Tensor):
 
         return higher_precision_tensor
 
-    def transpose(self):
-        return Float8Tensor(
-            data=self._data.transpose(0,1).detach().clone(),
-            fp8_meta_view=self.fp8_meta_view,
-            gemm_index=self.gemm_index,
-            fake_dtype=self.dtype
-        )
+    def transpose(self, *args):
+        if self._transpose is None:
+            self._transpose = Float8Tensor(
+                data=self._data.detach().clone().transpose(0,1),
+                fp8_meta_view=self.fp8_meta_view,
+                gemm_index=self.gemm_index,
+                fake_dtype=self.dtype
+            )
+
+        return self._transpose
 
     def cpu(self):
         return self.upcast_from_fp8().cpu()
