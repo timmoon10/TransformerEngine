@@ -194,11 +194,13 @@ class _LayerNormMLP(torch.autograd.Function):
                 if is_grad_enabled:
                     if primary_weights_in_fp8:
                         fc1_weight_fp8 = fc1_weight
+                        fc1_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc1_weight_fp8.gemm_index] = fc1_weight_fp8._scale_inv_cache
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         fc1_weight_t_fp8 = fc1_weight_fp8.transpose()
                         assert hasattr(fc1_weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
 
                         fc2_weight_fp8 = fc2_weight
+                        fc2_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc2_weight_fp8.gemm_index] = fc2_weight_fp8._scale_inv_cache
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         fc2_weight_t_fp8 = fc2_weight_fp8.transpose()
                         assert hasattr(fc2_weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
@@ -226,7 +228,9 @@ class _LayerNormMLP(torch.autograd.Function):
 
                     if primary_weights_in_fp8:
                         fc1_weight_fp8 = fc1_weight
+                        fc1_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc1_weight_fp8.gemm_index] = fc1_weight_fp8._scale_inv_cache
                         fc2_weight_fp8 = fc2_weight
+                        fc2_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc2_weight_fp8.gemm_index] = fc2_weight_fp8._scale_inv_cache
                     else:
                         fc1_weight_fp8 = tex.cast_to_fp8(
                             fc1_weight,
@@ -1056,6 +1060,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                     tex.DType.kFloat8E4M3,
                 ),
                 fp8_meta_view=self.fp8_meta,
+                gemm_index=tex.FP8FwdTensors.GEMM1_WEIGHT
             )
 
         self.fc1_weight = Parameter(temp_weight)
@@ -1095,6 +1100,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                     tex.DType.kFloat8E4M3,
                 ),
                 fp8_meta_view=self.fp8_meta,
+                gemm_index=tex.FP8FwdTensors.GEMM2_WEIGHT
             )
 
         self.fc2_weight = Parameter(temp_weight)
