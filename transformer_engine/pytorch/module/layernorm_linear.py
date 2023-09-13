@@ -161,6 +161,7 @@ class _LayerNormLinear(torch.autograd.Function):
                 if is_grad_enabled:
                     if primary_weights_in_fp8:
                         weight_fp8 = weight
+                        weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[weight_fp8.gemm_index] = weight_fp8._scale_inv_cache
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         weight_t_fp8 = weight.transpose()
                         assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
@@ -177,6 +178,7 @@ class _LayerNormLinear(torch.autograd.Function):
                     weight_t_fp8 = None
                     if primary_weights_in_fp8:
                         weight_fp8 = weight
+                        weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[weight_fp8.gemm_index] = weight_fp8._scale_inv_cache
                     else:
                         weight_fp8._data = tex.cast_to_fp8(
                             weight,
@@ -714,14 +716,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
             print("assigning weights in fp8")
             self.fp8_init()
             self.fp8_meta["update_amax_and_scale_fwd"] = True
-            # Assign the correct scale to the `fp8_meta` dictionary
-            # self.fp8_meta["scaling_fwd"][1] = tensor_to_scale(temp_weight, E4M3)
-            # TODO(ksivaman): Remove hardcoded fp8 weight and hardcoded FP8 flavor.
-            # self.weight_tensor = Float8Tensor.from_float32(
-            #     temp_weight,
-            #     tensor_to_scale(temp_weight, E4M3),
-            #     E4M3,
-            # )
+
             self.weight_tensor = Float8Tensor(
                 data = tex.cast_to_fp8(
                     temp_weight,
@@ -730,6 +725,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
                     tex.DType.kFloat8E4M3,
                 ),
                 fp8_meta_view=self.fp8_meta,
+                gemm_index=tex.FP8FwdTensors.GEMM1_WEIGHT,
             )
         else:
             self.weight_tensor = temp_weight

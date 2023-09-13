@@ -658,6 +658,9 @@ class Linear(TransformerEngineBaseModule):
 
             # TODO(ksivaman): Add indexing op to torch dispatcher for float8
             if self.primary_weights_in_fp8:
+                assert len(parameters_split) == 1, ("Slicing operation is not "
+                                                    "supported in Float8Tensor "
+                                                    "class!")
                 self.register_parameter(wname, Parameter(self.weight_tensor))
             else:
                 self.register_parameter(
