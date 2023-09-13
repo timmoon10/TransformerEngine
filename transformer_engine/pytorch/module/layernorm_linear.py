@@ -164,7 +164,6 @@ class _LayerNormLinear(torch.autograd.Function):
                         weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[weight_fp8.gemm_index] = weight_fp8._scale_inv_cache
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         weight_t_fp8 = weight.transpose()
-                        assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
                     else:
                         tex.fp8_cast_transpose_fused(
                             weight,
@@ -180,11 +179,18 @@ class _LayerNormLinear(torch.autograd.Function):
                         weight_fp8 = weight
                         weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[weight_fp8.gemm_index] = weight_fp8._scale_inv_cache
                     else:
+                        # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
                         weight_fp8._data = tex.cast_to_fp8(
                             weight,
                             fp8_meta["scaling_fwd"],
                             tex.FP8FwdTensors.GEMM1_WEIGHT,
                             fp8_dtype_forward)
+            elif primary_weights_in_fp8:
+                weight_fp8 = weight
+                weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[weight_fp8.gemm_index] = weight_fp8._scale_inv_cache
+                if is_grad_enabled:
+                    #NOTE (sudhakars): Handle this function in `torch_dispatch later`
+                    weight_t_fp8 = weight.transpose()
 
             out = tex.fp8_gemm(
                 weight_fp8._data,

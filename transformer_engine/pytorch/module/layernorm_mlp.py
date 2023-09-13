@@ -197,13 +197,11 @@ class _LayerNormMLP(torch.autograd.Function):
                         fc1_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc1_weight_fp8.gemm_index] = fc1_weight_fp8._scale_inv_cache
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         fc1_weight_t_fp8 = fc1_weight_fp8.transpose()
-                        assert hasattr(fc1_weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
 
                         fc2_weight_fp8 = fc2_weight
                         fc2_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc2_weight_fp8.gemm_index] = fc2_weight_fp8._scale_inv_cache
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         fc2_weight_t_fp8 = fc2_weight_fp8.transpose()
-                        assert hasattr(fc2_weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
                     else:
                         tex.fp8_cast_transpose_fused(
                             fc1_weight,
@@ -232,18 +230,32 @@ class _LayerNormMLP(torch.autograd.Function):
                         fc2_weight_fp8 = fc2_weight
                         fc2_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc2_weight_fp8.gemm_index] = fc2_weight_fp8._scale_inv_cache
                     else:
-                        fc1_weight_fp8 = tex.cast_to_fp8(
+                        # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
+                        fc1_weight_fp8._data = tex.cast_to_fp8(
                             fc1_weight,
                             fp8_meta["scaling_fwd"],
                             tex.FP8FwdTensors.GEMM1_WEIGHT,
                             fp8_dtype_forward,
                         )
-                        fc2_weight_fp8 = tex.cast_to_fp8(
+                        # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
+                        fc2_weight_fp8._data = tex.cast_to_fp8(
                             fc2_weight,
                             fp8_meta["scaling_fwd"],
                             tex.FP8FwdTensors.GEMM2_WEIGHT,
                             fp8_dtype_forward,
                         )
+            elif primary_weights_in_fp8:
+                fc1_weight_fp8 = fc1_weight
+                fc1_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc1_weight_fp8.gemm_index] = fc1_weight_fp8._scale_inv_cache
+
+                fc2_weight_fp8 = fc2_weight
+                fc2_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc2_weight_fp8.gemm_index] = fc2_weight_fp8._scale_inv_cache
+
+                if is_grad_enabled:
+                    #NOTE (sudhakars): Handle this function in `torch_dispatch later`
+                    fc1_weight_t_fp8 = fc1_weight_fp8.transpose()
+                    #NOTE (sudhakars): Handle this function in `torch_dispatch later`
+                    fc2_weight_t_fp8 = fc2_weight_fp8.transpose()
 
             fc1_out = tex.fp8_gemm(
                 fc1_weight_fp8._data,

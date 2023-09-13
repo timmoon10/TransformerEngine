@@ -150,7 +150,6 @@ class _Linear(torch.autograd.Function):
                         weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[weight_fp8.gemm_index] = weight_fp8._scale_inv_cache
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         weight_t_fp8 = weight.transpose()
-                        assert hasattr(weight_t_fp8, "_data"), "_data attr doesn't exist (after transpose)"
                     else:
                         fp8_cast_transpose_fused(
                         weight,
@@ -173,6 +172,12 @@ class _Linear(torch.autograd.Function):
                             tex.FP8FwdTensors.GEMM1_WEIGHT,
                             fp8_dtype_forward,
                         )
+            elif primary_weights_in_fp8:
+                weight_fp8 = weight
+                weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[weight_fp8.gemm_index] = weight_fp8._scale_inv_cache
+                if is_grad_enabled:
+                    #NOTE (sudhakars): Handle this function in `torch_dispatch later`
+                    weight_t_fp8 = weight.transpose()
 
             if ub_split_rs:
                 ub_obj_projout = get_ub("proj_fprop")
