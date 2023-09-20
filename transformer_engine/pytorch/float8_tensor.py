@@ -158,13 +158,16 @@ class Float8Tensor(torch.Tensor):
 
     def transpose(self, *args):
         if self._transpose is None:
+            fp8_dtype = get_fp8_te_dtype(
+                self.fp8_meta_view["recipe"],
+                fprop_tensor=True,
+            )
             self._transpose = Float8Tensor(
-                data=self._data.detach().clone().transpose(0,1),
+                data=tex.fp8_transpose(self._data.detach(), fp8_dtype),
                 fp8_meta_view=self.fp8_meta_view,
                 gemm_index=self.gemm_index,
                 fake_dtype=self.dtype
             )
-
         return self._transpose
 
     def cpu(self):
