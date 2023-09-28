@@ -496,7 +496,6 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                         device=torch.cuda.current_device(),
                         dtype=torch.uint8,
                     ),
-                    scale=None, flavor=None
                 )
             )
             setattr(
@@ -509,7 +508,6 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                         device=torch.cuda.current_device(),
                         dtype=torch.uint8,
                     ),
-                    scale=None, flavor=None
                 )
             )
 
