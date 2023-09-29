@@ -388,7 +388,8 @@ class Float8Tensor(torch.Tensor):
         if func == aten.copy_.default:
 
             # Check tensors
-            dst, src = args
+            dst = args[0]
+            src = args[1]
             if not isinstance(dst, Float8Tensor):
                 raise RuntimeError("Expected to copy into Float8Tensor")
             if not isinstance(src, torch.Tensor):
@@ -520,12 +521,11 @@ class Float8Tensor(torch.Tensor):
             return None
 
         # Default op
-        # Note: cast to higher precision, perform op, cast back to FP8
+        # Note: cast to higher precision and perform op
         args = tree_map(maybe_unwrap, args)
         if kwargs is not None:
             kwargs = tree_map(maybe_unwrap, kwargs)
         out = super().__torch_dispatch__(func, types, args, kwargs)
-        out = tree_map(maybe_wrap, out)
         return out
 
     # Do not force the Float8Tensor type on the returned tensor
