@@ -492,23 +492,27 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 self,
                 weight_cast_attr,
                 Float8Tensor(
-                    torch.empty(
+                    data=torch.empty(
                         shape,
                         device=torch.cuda.current_device(),
                         dtype=torch.uint8,
                     ),
+                    fp8_dtype=get_default_fp8_recipe().fp8_format,
+                    fp8_scale_inv=1,
                 )
             )
             setattr(
                 self,
                 weight_transpose_attr,
                 Float8Tensor(
-                    torch.empty(
+                    data=torch.empty(
                         shape[1],
                         shape[0],
                         device=torch.cuda.current_device(),
                         dtype=torch.uint8,
                     ),
+                    fp8_dtype=get_default_fp8_recipe().fp8_format,
+                    fp8_scale_inv=1,
                 )
             )
 

@@ -143,15 +143,23 @@ class _Linear(torch.autograd.Function):
             )
             bias = cast_if_needed(bias, bias_dtype) if use_bias else bias
 
-            if update_fp8_weights:
+            if primary_weights_in_fp8:
+                # Weight is already in FP8
+                weight.reset_fp8_meta_scale_inv()
+                weight_fp8 = weight
+                weight_t_fp8 = None
                 if is_grad_enabled:
-                    if primary_weights_in_fp8:
-                        weight_fp8 = weight
-                        weight_fp8.reset_fp8_meta_scale_inv()
-                        #NOTE (sudhakars): Handle this function in `torch_dispatch later`
-                        weight_t_fp8 = weight.transpose()
-                    else:
-                        fp8_cast_transpose_fused(
+                    weight_t_fp8 = weight_fp8.transpose()
+
+            elif update_fp8_weights:
+                # Need to cast weights to FP8
+                weight_fp8 = Float8Tensor(
+                    data=weight_fp8._data,
+                    fp8_meta=fp8_meta,
+                    fp8_meta_index=tex.FP8FwdTensors.GEMM1_WEIGHT,
+                )
+                if is_grad_enabled:
+                    tex.fp8_cast_transpose_fused(
                         weight,
                         fp8_meta["scaling_fwd"],
                         tex.FP8FwdTensors.GEMM1_WEIGHT,
@@ -160,24 +168,8 @@ class _Linear(torch.autograd.Function):
                         transpose_out=weight_t_fp8._data,
                     )
                 else:
+                    weight_fp8.copy_(weight)
                     weight_t_fp8 = None
-                    if primary_weights_in_fp8:
-                        weight_fp8 = weight
-                        weight_fp8.reset_fp8_meta_scale_inv()
-                    else:
-                        # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
-                        weight_fp8._data = cast_to_fp8(
-                            weight,
-                            fp8_meta["scaling_fwd"],
-                            tex.FP8FwdTensors.GEMM1_WEIGHT,
-                            fp8_dtype_forward,
-                        )
-            elif primary_weights_in_fp8:
-                weight_fp8 = weight
-                weight_fp8.reset_fp8_meta_scale_inv()
-                if is_grad_enabled:
-                    #NOTE (sudhakars): Handle this function in `torch_dispatch later`
-                    weight_t_fp8 = weight.transpose()
 
             if ub_split_rs:
                 ub_obj_projout = get_ub("proj_fprop")

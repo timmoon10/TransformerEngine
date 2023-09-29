@@ -190,72 +190,53 @@ class _LayerNormMLP(torch.autograd.Function):
             fc1_bias = cast_if_needed(fc1_bias, bias_dtype) if use_fc1_bias else fc1_bias
             fc2_bias = cast_if_needed(fc2_bias, bias_dtype) if use_fc2_bias else fc2_bias
 
-            if update_fp8_weights:
-                if is_grad_enabled:
-                    if primary_weights_in_fp8:
-                        fc1_weight_fp8 = fc1_weight
-                        fc1_weight_fp8.reset_fp8_meta_scale_inv()
-                        #NOTE (sudhakars): Handle this function in `torch_dispatch later`
-                        fc1_weight_t_fp8 = fc1_weight_fp8.transpose()
-
-                        fc2_weight_fp8 = fc2_weight
-                        fc2_weight_fp8.reset_fp8_meta_scale_inv()
-                        #NOTE (sudhakars): Handle this function in `torch_dispatch later`
-                        fc2_weight_t_fp8 = fc2_weight_fp8.transpose()
-                    else:
-                        tex.fp8_cast_transpose_fused(
-                            fc1_weight,
-                            fp8_meta["scaling_fwd"],
-                            tex.FP8FwdTensors.GEMM1_WEIGHT,
-                            fp8_dtype_forward,
-                            cast_out=fc1_weight_fp8._data,
-                            transpose_out=fc1_weight_t_fp8._data,
-                        )
-
-                        tex.fp8_cast_transpose_fused(
-                            fc2_weight,
-                            fp8_meta["scaling_fwd"],
-                            tex.FP8FwdTensors.GEMM2_WEIGHT,
-                            fp8_dtype_forward,
-                            cast_out=fc2_weight_fp8._data,
-                            transpose_out=fc2_weight_t_fp8._data,
-                        )
-                else:
-                    fc1_weight_t_fp8 = None
-                    fc2_weight_t_fp8 = None
-
-                    if primary_weights_in_fp8:
-                        fc1_weight_fp8 = fc1_weight
-                        fc1_weight_fp8.reset_fp8_meta_scale_inv()
-                        fc2_weight_fp8 = fc2_weight
-                        fc2_weight_fp8.reset_fp8_meta_scale_inv()
-                    else:
-                        # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
-                        fc1_weight_fp8._data = tex.cast_to_fp8(
-                            fc1_weight,
-                            fp8_meta["scaling_fwd"],
-                            tex.FP8FwdTensors.GEMM1_WEIGHT,
-                            fp8_dtype_forward,
-                        )
-                        # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
-                        fc2_weight_fp8._data = tex.cast_to_fp8(
-                            fc2_weight,
-                            fp8_meta["scaling_fwd"],
-                            tex.FP8FwdTensors.GEMM2_WEIGHT,
-                            fp8_dtype_forward,
-                        )
-            elif primary_weights_in_fp8:
+            if primary_weights_in_fp8:
+                # Weights are already in FP8
+                fc1_weight.reset_fp8_meta_scale_inv()
+                fc2_weight.reset_fp8_meta_scale_inv()
                 fc1_weight_fp8 = fc1_weight
-                fc1_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc1_weight_fp8.gemm_index] = fc1_weight_fp8._scale_inv_cache
-
                 fc2_weight_fp8 = fc2_weight
-                fc2_weight_fp8.fp8_meta_view['scaling_fwd'].scale_inv[fc2_weight_fp8.gemm_index] = fc2_weight_fp8._scale_inv_cache
-
+                fc1_weight_t_fp8 = None
+                fc2_weight_t_fp8 = None
                 if is_grad_enabled:
-                    #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                     fc1_weight_t_fp8 = fc1_weight_fp8.transpose()
-                    #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                     fc2_weight_t_fp8 = fc2_weight_fp8.transpose()
+
+            elif update_fp8_weights:
+                # Need to cast weights to FP8
+                fc1_weight_fp8 = Float8Tensor(
+                    data=fc1_weight_fp8._data,
+                    fp8_meta=fp8_meta,
+                    fp8_meta_index=tex.FP8FwdTensors.GEMM1_WEIGHT,
+                )
+                fc2_weight_fp8 = Float8Tensor(
+                    data=fc2_weight_fp8._data,
+                    fp8_meta=fp8_meta,
+                    fp8_meta_index=tex.FP8FwdTensors.GEMM2_WEIGHT,
+                )
+                if is_grad_enabled:
+                    # Fused cast-transpose kernels
+                    tex.fp8_cast_transpose_fused(
+                        fc1_weight,
+                        fp8_meta["scaling_fwd"],
+                        tex.FP8FwdTensors.GEMM1_WEIGHT,
+                        fp8_dtype_forward,
+                        cast_out=fc1_weight_fp8._data,
+                        transpose_out=fc1_weight_t_fp8._data,
+                    )
+                    tex.fp8_cast_transpose_fused(
+                        fc2_weight,
+                        fp8_meta["scaling_fwd"],
+                        tex.FP8FwdTensors.GEMM2_WEIGHT,
+                        fp8_dtype_forward,
+                        cast_out=fc2_weight_fp8._data,
+                        transpose_out=fc2_weight_t_fp8._data,
+                    )
+                else:
+                    fc1_weight_fp8.copy_(fc1_weight)
+                    fc1_weight_t_fp8 = None
+                    fc2_weight_fp8.copy_(fc2_weight)
+                    fc2_weight_t_fp8 = None
 
             fc1_out = tex.fp8_gemm(
                 fc1_weight_fp8._data,
