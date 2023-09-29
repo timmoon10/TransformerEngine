@@ -318,7 +318,7 @@ class Float8Tensor(torch.Tensor):
             return super().expand_as(other)
 
     def transpose(self, dim0: int = 0, dim1: int = 1) -> Float8Tensor:
-        ### TODO Handle differentiation
+        # TODO Support differentiation
         if self.dim() != 2:
             raise RuntimeError(
                 "Float8Tensor only supports transposing 2D tensors "
@@ -357,65 +357,35 @@ class Float8Tensor(torch.Tensor):
         scale_inv = self._fp8_meta[fp8_meta_key].scale_inv[self._fp8_meta_index]
         scale_inv.copy_(self._scale_inv)
 
-    def to_fake_dtype(self, dtype):
-        ### TODO Clean up
-        if self.dtype is not dtype:
-            converted_tensor = Float8Tensor(
-                data=self._data,
-                fp8_meta_view=self.fp8_meta_view,
-                fp8_meta_index=self._fp8_meta_index,
-                fake_dtype=dtype
-            )
-        else:
-            converted_tensor = self
-        return converted_tensor
+    def to_dtype(self, dtype: torch.dtype) -> Float8Tensor:
+        """Create `Float8Tensor` with given nominal dtype
+
+        The new tensor has the same underlying FP8 data.
+
+        """
+
+        return Float8Tensor(
+            data=self._data,
+            fp8_meta=tensor._fp8_meta,
+            fp8_meta_index=tensor._fp8_meta_index,
+            fp8_dtype=tensor._fp8_dtype,
+            fp8_scale_inv=tensor._scale_inv,
+            dtype=dtype,
+        )
+
+    def _reset_caches(self) -> None:
+        """Reset cached values
+
+        Should be called after any in-place operation.
+
+        """
+        self._transpose = None
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
 
-        # FP8 tensor to base FP8 casts upon
-        base_fp8_tensor = None
-        for t in args:
-            if isinstance(t, Float8Tensor):
-                base_fp8_tensor = t
-                break
-
-        def maybe_unwrap(t):
-            if isinstance(t, Float8Tensor):
-                return t.from_float8()
-            return t
-
-        def maybe_wrap(t):
-            if not isinstance(t, Float8Tensor):
-                return Float8Tensor.to_float8(
-                    t,
-                    fp8_meta=base_fp8_tensor._fp8_meta,
-                    fp8_meta_index=base_fp8_tensor._fp8_meta_index,
-                    fp8_dtype=base_fp8_tensor._fp8_dtype,
-                    scale=base_fp8_tensor._scale_inv.reciprocal(),
-                    amax=torch.empty_like(base_fp8_tensor._scale_inv),
-                    scale_inv=base_fp8_tensor._scale_inv,
-                )
-            return t
-
-        def maybe_wrap_and_update_inplace(arg, new_arg, schema_arg):
-            """
-            This converts the higher precision tensor to FP8 in-place in the
-            sense that the original FP8 tensor's `_data` attribute gets updated.
-            The "scale" values are already updated/maintained in the
-            `fp8_meta_view` attr for FP8 tensor.
-            """
-            if(
-                isinstance(arg, Float8Tensor) and
-                isinstance(new_arg, torch.Tensor) and
-                hasattr(schema_arg, 'alias_info') and
-                hasattr(schema_arg.alias_info, 'is_write') and
-                schema_arg.alias_info.is_write
-            ):
-                arg.copy_(new_arg)
-
-        # In-place copy
-        if func is aten.copy_.default:
+        # In-place copy op
+        if func == aten.copy_.default:
 
             # Check tensors
             dst, src = args
@@ -426,12 +396,16 @@ class Float8Tensor(torch.Tensor):
             if not dst._data.is_contiguous():
                 raise RuntimeError("Transformer Engine cast kernels require contiguous data")
 
-            # Cast to FP8
-            src.expand_as(dst)
+            # Make sure input is in expected format
+            if isinstance(src, Float8Tensor):
+                src = src.from_float8()
+            src = src.expand(dst.size())
             src = src.to(
                 device=dst.device,
                 memory_format=torch.contiguous_format,
             )
+
+            # Cast to FP8
             tex.cast_to_fp8_noalloc(
                 src.view(1,-1),
                 dst._scale_inv.reciprocal(),
@@ -441,33 +415,36 @@ class Float8Tensor(torch.Tensor):
                 dst._fp8_dtype,
             )
 
-            # This is an inplace copy op, so nothing to return
+            # Nothing to return for in-place ops
+            dst._reset_caches()
             return None
 
-        if func._schema.is_mutable:
-            new_args = tree_map(maybe_unwrap, args)
-            new_kwargs = tree_map(maybe_unwrap, kwargs)
-            schema_args = func._schema.arguments
-            args_len = len(args)
-
-            out = super().__torch_dispatch__(func, types, new_args, new_kwargs)
-
-            for arg, new_arg, schema_arg in zip(args, new_args, schema_args):
-                maybe_wrap_and_update_inplace(arg, new_arg, schema_arg)
-
-            for kwarg, new_kwarg, schema_arg in zip(kwargs, new_kwargs, schema_args[args_len:]):
-                assert kwarg == new_kwarg == schema_arg.name, "name of the kw argument should match"
-                maybe_wrap_and_update_inplace(kwargs[kwarg], new_kwargs[new_kwarg], schema_arg)
-
-            return None
-
+        # Slice op
+        # TODO Keep track of master tensor so properly invalidate
+        # caches?
         if func == aten.slice.Tensor:
-            raise AssertionError("Slice operation on Float8Tensor is unsupported!")
+            tensor = args[0]
+            data = tensor._data
+            data_slice = data.__torch_dispatch__(
+                func,
+                types,
+                [data] + list(args[1:]),
+                kwargs,
+            )
+            return Float8Tensor(
+                data=data_slice,
+                fp8_meta=tensor._fp8_meta,
+                fp8_meta_index=tensor._fp8_meta_index,
+                fp8_dtype=tensor._fp8_dtype,
+                fp8_scale_inv=tensor._scale_inv,
+                dtype=tensor.dtype,
+            )
 
         if func == aten.transpose.int:
             raise AssertionError("Transpose operation on Float8Tensor is unsupported!")
             return args[0].transpose(0, 1)
 
+        # Detach op
         if func == aten.detach.default:
             # Simply return a new Float8Tensor with the same attrs
             tensor = args[0]
@@ -480,17 +457,75 @@ class Float8Tensor(torch.Tensor):
                 dtype=tensor.dtype,
             )
 
-        # TODO: (ksivaman) For all other cases, cast back to higher precision
-        # weights, then convert back to FP8
+        # Find FP8 tensor so we can get its FP8 scaling factors
+        base_fp8_tensor = None
+        for t in args:
+            if isinstance(t, Float8Tensor):
+                base_fp8_tensor = t
+                break
+
+        def maybe_unwrap(t):
+            if isinstance(t, Float8Tensor):
+                return t.from_float8()
+            return t
+
+
+        def maybe_wrap(t):
+            if not isinstance(t, Float8Tensor):
+                assert base_fp8_tensor is not None, (
+                    "Could not find Float8Tensor. "
+                    "Unclear what scaling factors to use for FP8 casts."
+                )
+                return Float8Tensor.to_float8(
+                    t,
+                    fp8_meta=base_fp8_tensor._fp8_meta,
+                    fp8_meta_index=base_fp8_tensor._fp8_meta_index,
+                    fp8_dtype=base_fp8_tensor._fp8_dtype,
+                    scale=base_fp8_tensor._scale_inv.reciprocal(),
+                    amax=torch.empty_like(base_fp8_tensor._scale_inv),
+                    scale_inv=base_fp8_tensor._scale_inv,
+                )
+            return t
+
+        def maybe_update_inplace(arg, new_arg, schema_arg):
+            """Update values of FP8 tensors
+
+            Keep the same FP8 scaling factors.
+
+            """
+            if(
+                isinstance(arg, Float8Tensor) and
+                isinstance(new_arg, torch.Tensor) and
+                hasattr(schema_arg, 'alias_info') and
+                hasattr(schema_arg.alias_info, 'is_write') and
+                schema_arg.alias_info.is_write
+            ):
+                arg.copy_(new_arg)
+                arg._reset_caches()
+
+        # In-place op
+        if func._schema.is_mutable:
+            # Cast to higher precision, perform op, and cast values
+            # back to original FP8 buffers
+            new_args = tree_map(maybe_unwrap, args)
+            new_kwargs = tree_map(maybe_unwrap, kwargs)
+            schema_args = func._schema.arguments
+            args_len = len(args)
+            out = super().__torch_dispatch__(func, types, new_args, new_kwargs)
+            for arg, new_arg, schema_arg in zip(args, new_args, schema_args):
+                maybe_update_inplace(arg, new_arg, schema_arg)
+            for kwarg, new_kwarg, schema_arg in zip(kwargs, new_kwargs, schema_args[args_len:]):
+                assert kwarg == new_kwarg == schema_arg.name, "name of the kw argument should match"
+                maybe_update_inplace(kwargs[kwarg], new_kwargs[new_kwarg], schema_arg)
+            return None
+
+        # Default op
+        # Note: cast to higher precision, perform op, cast back to FP8
         args = tree_map(maybe_unwrap, args)
         if kwargs is not None:
             kwargs = tree_map(maybe_unwrap, kwargs)
-
         out = super().__torch_dispatch__(func, types, args, kwargs)
-
-        # Convert the output back to FP8
         out = tree_map(maybe_wrap, out)
-
         return out
 
     # Do not force the Float8Tensor type on the returned tensor
