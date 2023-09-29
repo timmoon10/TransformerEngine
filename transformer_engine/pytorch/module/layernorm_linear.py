@@ -161,7 +161,7 @@ class _LayerNormLinear(torch.autograd.Function):
                 if is_grad_enabled:
                     if primary_weights_in_fp8:
                         weight_fp8 = weight
-                        weight_fp8.swap_scale_inv_with_fp8_meta()
+                        weight_fp8.reset_fp8_meta_scale_inv()
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         weight_t_fp8 = weight.transpose()
                     else:
@@ -177,7 +177,7 @@ class _LayerNormLinear(torch.autograd.Function):
                     weight_t_fp8 = None
                     if primary_weights_in_fp8:
                         weight_fp8 = weight
-                        weight_fp8.swap_scale_inv_with_fp8_meta()
+                        weight_fp8.reset_fp8_meta_scale_inv()
                     else:
                         # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
                         weight_fp8._data = tex.cast_to_fp8(
@@ -187,7 +187,7 @@ class _LayerNormLinear(torch.autograd.Function):
                             fp8_dtype_forward)
             elif primary_weights_in_fp8:
                 weight_fp8 = weight
-                weight_fp8.swap_scale_inv_with_fp8_meta()
+                weight_fp8.reset_fp8_meta_scale_inv()
                 if is_grad_enabled:
                     #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                     weight_t_fp8 = weight.transpose()
@@ -723,15 +723,10 @@ class LayerNormLinear(TransformerEngineBaseModule):
             self.fp8_init()
             self.fp8_meta["update_amax_and_scale_fwd"] = True
 
-            self.weight_tensor = Float8Tensor(
-                data = tex.cast_to_fp8(
-                    temp_weight,
-                    self.fp8_meta["scaling_fwd"],
-                    tex.FP8FwdTensors.GEMM1_WEIGHT,
-                    tex.DType.kFloat8E4M3,
-                ),
-                fp8_meta_view=self.fp8_meta,
-                gemm_index=tex.FP8FwdTensors.GEMM1_WEIGHT,
+            self.weight_tensor = Float8Tensor.to_float8(
+                temp_weight,
+                fp8_meta=self.fp8_meta,
+                fp8_meta_index=tex.FP8FwdTensors.GEMM1_WEIGHT,
             )
         else:
             self.weight_tensor = temp_weight

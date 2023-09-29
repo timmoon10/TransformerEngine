@@ -487,6 +487,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             ):
                 return
 
+            ### TODO Revert to non-Float8Tensor impl
             setattr(
                 self,
                 weight_cast_attr,
@@ -800,6 +801,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                                             "`is_first_microbatch` is None!"
         fp8_weight_tensors = []
         for shape in self.fp8_weight_shapes:
+            ### TODO Revert to non-Float8Tensor impl
             fp8_weight_tensors.append(
                 Float8Tensor(
                     torch.empty(

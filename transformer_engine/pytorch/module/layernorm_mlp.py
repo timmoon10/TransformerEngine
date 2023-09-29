@@ -194,12 +194,12 @@ class _LayerNormMLP(torch.autograd.Function):
                 if is_grad_enabled:
                     if primary_weights_in_fp8:
                         fc1_weight_fp8 = fc1_weight
-                        fc1_weight_fp8.swap_scale_inv_with_fp8_meta()
+                        fc1_weight_fp8.reset_fp8_meta_scale_inv()
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         fc1_weight_t_fp8 = fc1_weight_fp8.transpose()
 
                         fc2_weight_fp8 = fc2_weight
-                        fc2_weight_fp8.swap_scale_inv_with_fp8_meta()
+                        fc2_weight_fp8.reset_fp8_meta_scale_inv()
                         #NOTE (sudhakars): Handle this function in `torch_dispatch later`
                         fc2_weight_t_fp8 = fc2_weight_fp8.transpose()
                     else:
@@ -226,9 +226,9 @@ class _LayerNormMLP(torch.autograd.Function):
 
                     if primary_weights_in_fp8:
                         fc1_weight_fp8 = fc1_weight
-                        fc1_weight_fp8.swap_scale_inv_with_fp8_meta()
+                        fc1_weight_fp8.reset_fp8_meta_scale_inv()
                         fc2_weight_fp8 = fc2_weight
-                        fc2_weight_fp8.swap_scale_inv_with_fp8_meta()
+                        fc2_weight_fp8.reset_fp8_meta_scale_inv()
                     else:
                         # TODO(sudhakarsingh27): directly updating `_data` attr isn't a good idea
                         fc1_weight_fp8._data = tex.cast_to_fp8(
@@ -1064,15 +1064,10 @@ class LayerNormMLP(TransformerEngineBaseModule):
             self.fp8_init(num_gemms=2)
             self.fp8_meta["update_amax_and_scale_fwd"] = True
 
-            temp_weight = Float8Tensor(
-                data = tex.cast_to_fp8(
-                    temp_weight,
-                    self.fp8_meta["scaling_fwd"],
-                    tex.FP8FwdTensors.GEMM1_WEIGHT,
-                    tex.DType.kFloat8E4M3,
-                ),
-                fp8_meta_view=self.fp8_meta,
-                gemm_index=tex.FP8FwdTensors.GEMM1_WEIGHT
+            temp_weight = Float8Tensor.to_float8(
+                temp_weight,
+                fp8_meta=self.fp8_meta,
+                fp8_meta_index=tex.FP8FwdTensors.GEMM1_WEIGHT,
             )
 
         self.fc1_weight = Parameter(temp_weight)
@@ -1104,15 +1099,10 @@ class LayerNormMLP(TransformerEngineBaseModule):
             self.fp8_init(num_gemms=2)
             self.fp8_meta["update_amax_and_scale_fwd"] = True
 
-            temp_weight = Float8Tensor(
-                data = tex.cast_to_fp8(
-                    temp_weight,
-                    self.fp8_meta["scaling_fwd"],
-                    tex.FP8FwdTensors.GEMM2_WEIGHT,
-                    tex.DType.kFloat8E4M3,
-                ),
-                fp8_meta_view=self.fp8_meta,
-                gemm_index=tex.FP8FwdTensors.GEMM2_WEIGHT
+            temp_weight = Float8Tensor.to_float8(
+                temp_weight,
+                fp8_meta=self.fp8_meta,
+                fp8_meta_index=tex.FP8FwdTensors.GEMM2_WEIGHT,
             )
 
         self.fc2_weight = Parameter(temp_weight)
