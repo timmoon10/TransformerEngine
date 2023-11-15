@@ -46,8 +46,8 @@ simplifying mixed precision training for users.
 Highlights
 ----------
 
-* Easy-to-use modules for building Transformer layers with FP8 support 
-* Optimizations (e.g. fused kernels) for Transformer models 
+* Easy-to-use modules for building Transformer layers with FP8 support
+* Optimizations (e.g. fused kernels) for Transformer models
 * Support for FP8 on NVIDIA Hopper and NVIDIA Ada GPUs
 * Support for optimizations across all precisions (FP16, BF16) on NVIDIA Ampere GPU architecture generations and later
 
@@ -126,39 +126,6 @@ Flax
 
       for _ in range(10):
         loss, (param_grads, other_grads) = fwd_bwd_fn(params, other_variables, inp)
-        # Update FP8 metas
-        other_variables = te.update_fp8_metas(other_grads)
-
-TensorFlow
-^^^^^^^^^^
-
-.. code-block:: python
-
-  import tensorflow as tf
-  import transformer_engine.tensorflow as te
-  from transformer_engine.common import recipe
-  
-  # Set dimensions.
-  in_features = 768
-  out_features = 3072
-  hidden_size = 2048
-  
-  # Initialize model and inputs.
-  model = te.Dense(out_features, use_bias=True)
-  inp = tf.random.normal((hidden_size, in_features))
-  
-  optimizer = tf.keras.optimizers.Adam(0.001)
-  
-  # Create FP8 recipe. Note: All input args are optional.
-  fp8_recipe = recipe.DelayedScaling(margin=0, interval=1, fp8_format=recipe.Format.E4M3)
-  
-  with tf.GradientTape(persistent=True) as tape:
-      # Enables autocasting for the forward pass
-      with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-          out = model(inp)
-      loss = tf.reduce_sum(out)
-  grads = tape.gradient(loss, model.trainable_variables)
-  optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
 .. overview-end-marker-do-not-remove
 
@@ -166,37 +133,47 @@ Installation
 ----------
 .. installation
 
-In the NGC container
-^^^^^^^^^^^^^^^^^^^^
-
-The quickest way to get started with Transformer Engine is the NGC PyTorch container on
-`NVIDIA GPU Cloud Catalog <https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch>`_ (versions 22.09 and later).
-
-.. code-block:: bash
-
-    docker run --gpus all -it --rm nvcr.io/nvidia/pytorch:23.04-py3
-
-Where 23.04 is the container version. For example, 23.04 for the April 2023 release.
-
 Pre-requisites
 ^^^^^^^^^^^^^^^^^^^^
 * Linux x86_64
-* CUDA 11.8 or later
+* CUDA 11.8+ for Hopper and CUDA 12.1+ for Ada
 * NVIDIA Driver supporting CUDA 11.8 or later
 * cuDNN 8.1 or later
 * For fused attention, CUDA 12.1 or later, NVIDIA Driver supporting CUDA 12.1 or later, and cuDNN 8.9 or later.
 
+Docker
+^^^^^^^^^^^^^^^^^^^^
+
+The quickest way to get started with Transformer Engine is by using Docker images on
+`NVIDIA GPU Cloud (NGC) Catalog <https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch>`_. For example to use the NGC PyTorch container interactively,
+
+.. code-block:: bash
+
+    docker run --gpus all -it --rm nvcr.io/nvidia/pytorch:23.10-py3
+
+Where 23.10 is the container version. For example, 23.10 for the October 2023 release.
+
+pip
+^^^^^^^^^^^^^^^^^^^^
+To install the latest stable version of Transformer Engine,
+
+.. code-block:: bash
+
+    pip install git+https://github.com/NVIDIA/TransformerEngine.git@stable
+
+This will automatically detect if any supported deep learning frameworks are installed and build Transformer Engine support for them. To explicitly specify frameworks, set the environment variable NVTE_FRAMEWORK to a comma-separated list (e.g. NVTE_FRAMEWORK=jax,pytorch).
+
 From source
 ^^^^^^^^^^^
+`See the installation guide <https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/installation.html#installation-from-source>`_.
 
-`See the installation guide <https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/installation.html>`_.
-
-Compiling with Flash Attention 2
+Compiling with FlashAttention-2
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Transformer Engine release v0.11.0 adds support for FlashAttention-2 in PyTorch for improved performance. 
 
-TransformerEngine release v0.11.0 adds support for Flash Attention 2.0 for improved performance. It is a known issue that Flash Attention 2.0 compilation is
-resource-intensive and requires a large amount of RAM (see `bug <https://github.com/Dao-AILab/flash-attention/issues/358>`_), which may lead to out of memory
-errors during the installation of TransformerEngine. Please try setting **MAX_JOBS=1** in the environment to circumvent the issue. If the errors persist, install a supported version of Flash Attention 1 (v1.0.6 to v1.0.9).
+It is a known issue that FlashAttention-2 compilation is resource-intensive and requires a large amount of RAM (see `bug <https://github.com/Dao-AILab/flash-attention/issues/358>`_), which may lead to out of memory errors during the installation of Transformer Engine. Please try setting **MAX_JOBS=1** in the environment to circumvent the issue. If the errors persist, install a supported version of FlashAttention-1 (v1.0.6 to v1.0.9).
+
+Note that NGC PyTorch 23.08+ containers include FlashAttention-2.
 
 Model Support
 ----------
@@ -205,7 +182,7 @@ While the more granular modules in Transformer Engine allow building any Transfo
 the `TransformerLayer` API of Transformer Engine is flexible enough to build multiple major
 Transformer model architectures.
 
-Transformer Engine supports the following DL frameworks: PyTorch, JAX (Flax, Praxis), and TensorFlow.
+Transformer Engine supports the following DL frameworks: PyTorch and JAX (Flax, Praxis).
 
 NOTE: For simplicity, we only show PyTorch examples below. For the usage of `TransformerLayer`
 of all supported frameworks, refer to `examples <https://github.com/NVIDIA/TransformerEngine/tree/main/examples>`_.
@@ -264,13 +241,13 @@ Integrations
 
 Transformer Engine has been integrated with popular LLM frameworks such as:
 
-* `DeepSpeed <https://github.com/microsoft/DeepSpeed/pull/3731>`_ 
-* `Hugging Face Accelerate <https://github.com/huggingface/accelerate/releases/tag/v0.17.0>`_ 
+* `DeepSpeed <https://github.com/microsoft/DeepSpeed/pull/3731>`_
+* `Hugging Face Accelerate <https://github.com/huggingface/accelerate/releases/tag/v0.17.0>`_
 * `Lightning <https://github.com/Lightning-AI/lightning/issues/17172>`_
-* `MosaicML Composer <https://github.com/mosaicml/composer/releases/tag/v0.13.1>`_ 
+* `MosaicML Composer <https://github.com/mosaicml/composer/releases/tag/v0.13.1>`_
 * `NVIDIA JAX Toolbox <https://github.com/NVIDIA/JAX-Toolbox>`_
-* `NVIDIA Megatron-LM <https://github.com/NVIDIA/Megatron-LM>`_ 
-* `NVIDIA NeMo <https://github.com/NVIDIA/NeMo>`_ 
+* `NVIDIA Megatron-LM <https://github.com/NVIDIA/Megatron-LM>`_
+* `NVIDIA NeMo <https://github.com/NVIDIA/NeMo>`_
 * `Amazon SageMaker Model Parallel Library <https://docs.aws.amazon.com/sagemaker/latest/dg/model-parallel.html>`_ - Coming soon!
 * `Colossal-AI <https://github.com/hpcaitech/ColossalAI>`_ - Coming soon!
 * `PeriFlow <https://github.com/friendliai/periflow-python-sdk>`_ - Coming soon!
@@ -280,7 +257,7 @@ Contributing
 ==================
 
 We welcome contributions to Transformer Engine! To contribute to Transformer Engine and make pull requests,
-follow the guidelines outlined in the `<CONTRIBUTING.rst>`_ guide. 
+follow the guidelines outlined in the `<CONTRIBUTING.rst>`_ guide.
 
 Papers
 ==================
@@ -293,9 +270,9 @@ Papers
 Videos
 ==================
 
-* `FP8 Training with Transformer Engine <https://www.nvidia.com/en-us/on-demand/session/gtcspring23-s51393>`_  
-* `FP8 for Deep Learning <https://www.nvidia.com/en-us/on-demand/session/gtcspring23-s52166/>`_  
-* `Inside the Hopper Architecture <https://www.nvidia.com/en-us/on-demand/session/gtcspring22-s42663/>`_  
+* `FP8 Training with Transformer Engine <https://www.nvidia.com/en-us/on-demand/session/gtcspring23-s51393>`_
+* `FP8 for Deep Learning <https://www.nvidia.com/en-us/on-demand/session/gtcspring23-s52166/>`_
+* `Inside the Hopper Architecture <https://www.nvidia.com/en-us/on-demand/session/gtcspring22-s42663/>`_
 
 .. |License| image:: https://img.shields.io/badge/License-Apache%202.0-blue.svg
    :target: https://opensource.org/licenses/Apache-2.0

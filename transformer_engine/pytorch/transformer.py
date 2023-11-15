@@ -6,13 +6,13 @@
 import os
 import warnings
 from contextlib import nullcontext
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
 import transformer_engine_extensions as tex
 from transformer_engine.pytorch.module import LayerNormMLP, LayerNorm, RMSNorm
-from transformer_engine.pytorch.attention import MultiheadAttention
+from transformer_engine.pytorch.attention import InferenceParams, MultiheadAttention
 from transformer_engine.pytorch.jit import (
     set_jit_fusion_options,
     warmup_jit_bias_dropout_add_all_dtypes,
@@ -68,11 +68,6 @@ class TransformerLayer(torch.nn.Module):
     TransformerLayer is made up of an attention block and a feedforward network (MLP).
     This standard layer is based on the paper "Attention Is All You Need".
 
-    .. warning::
-
-        Arguments :attr:`attention_softmax_in_fp32` and :attr:`apply_query_key_layer_scaling`
-        are deprecated and will be fully removed in the next release (v1.0.0).
-
     .. note::
 
         Argument :attr:`attention_mask` will be ignored in the `forward` call when
@@ -127,7 +122,7 @@ class TransformerLayer(torch.nn.Module):
     kv_channels: int, default = `None`
                 number of key-value channels. defaults to
                 :attr:`hidden_size` / :attr:`num_attention_heads` if `None`.
-    self_attn_mask_type: {'causal', 'padding', 'no_mask'}, default = `causal`
+    self_attn_mask_type: {'causal', 'padding', 'no_mask', 'arbitrary'}, default = `causal`
                         type of attention mask passed into softmax operation. Overridden by
                         :attr:`self_attn_mask_type` in the `forward` method. The forward
                         arg is useful for dynamically changing mask types, e.g. a different
@@ -224,8 +219,6 @@ class TransformerLayer(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         get_rng_state_tracker: Optional[Callable] = None,
         fuse_wgrad_accumulation: bool = False,
-        apply_query_key_layer_scaling: bool = False, # pylint: disable=unused-argument
-        attention_softmax_in_fp32: bool = True, # pylint: disable=unused-argument
         seq_length: Optional[int] = None,
         micro_batch_size: Optional[int] = None,
         sequence_parallel: bool = False,
@@ -245,12 +238,6 @@ class TransformerLayer(torch.nn.Module):
     ) -> None:
         super().__init__()
 
-        warnings.warn(
-            "Arguments `attention_softmax_in_fp32` and `apply_query_key_layer_scaling`"
-            "are deprecated and will be fully removed in the next release (v1.0.0).",
-            category=DeprecationWarning,
-        )
-
         if ub_tp_comm_overlap:
             assert (
                 tex.userbuf_comm_available()
@@ -263,6 +250,22 @@ class TransformerLayer(torch.nn.Module):
         ub_bulk_dgrad = ub_tp_comm_overlap and bool(int(os.getenv("NVTE_UB_BULK_DGRAD", "1")))
         ub_split_ag = ub_tp_comm_overlap and bool(int(os.getenv("NVTE_UB_SPLIT_AG", "1")))
         ub_split_rs = ub_tp_comm_overlap and bool(int(os.getenv("NVTE_UB_SPLIT_RS", "1")))
+        ub_atomic_gemm_rs = (ub_tp_comm_overlap
+                             and bool(int(os.getenv("NVTE_UB_ATOMIC_GEMM_RS", "0"))))
+        assert (
+            not (ub_split_rs and ub_atomic_gemm_rs)
+        ), "Only one type of RS overlap NVTE_UB_SPLIT_RS/NVTE_UB_ATOMIC_GEMM_RS should be enabled."
+        ub_atomic_gemm_ag = (ub_tp_comm_overlap
+                             and bool(int(os.getenv("NVTE_UB_ATOMIC_GEMM_AG", "0"))))
+        assert (
+            not (ub_split_ag and ub_atomic_gemm_ag)
+        ), "Only one type of AG overlap NVTE_UB_SPLIT_AG/NVTE_UB_ATOMIC_GEMM_AG should be enabled."
+
+        if ub_atomic_gemm_rs or ub_atomic_gemm_ag:
+            warnings.warn(
+                "Atomic gemm uses a beta API from cublas and is not tested for all use cases."
+            )
+
         bias_dropout_fusion = bool(int(os.getenv("NVTE_BIAS_DROPOUT_FUSION", "1")))
         self.layer_number = layer_number
         self.output_layernorm = output_layernorm
@@ -323,6 +326,8 @@ class TransformerLayer(torch.nn.Module):
             "ub_bulk_dgrad" : ub_bulk_dgrad,
             "ub_split_ag" : ub_split_ag,
             "ub_split_rs" : ub_split_rs,
+            "ub_atomic_gemm_rs" : ub_atomic_gemm_rs,
+            "ub_atomic_gemm_ag" : ub_atomic_gemm_ag,
         }
 
         self.self_attention = MultiheadAttention(
@@ -377,6 +382,8 @@ class TransformerLayer(torch.nn.Module):
             ub_bulk_dgrad=ub_bulk_dgrad,
             ub_split_rs=ub_split_rs,
             ub_split_ag=ub_split_ag,
+            ub_atomic_gemm_rs=ub_atomic_gemm_rs,
+            ub_atomic_gemm_ag=ub_atomic_gemm_ag,
             activation=activation,
             normalization=normalization,
             device=device,
@@ -418,7 +425,15 @@ class TransformerLayer(torch.nn.Module):
             )
 
     def set_tensor_parallel_group(self, tp_group: Union[dist_group_type, None]) -> None:
-        """Set TP group"""
+        """
+        Set the tensor parallel group for the given
+        module before executing the forward pass.
+
+        Parameters
+        ----------
+        tp_group : ProcessGroup, default = `None`
+                  tensor parallel process group.
+        """
         # Deep iterate but skip self to avoid infinite recursion.
         for index, child in enumerate(self.modules()):
             if index == 0:
@@ -426,19 +441,31 @@ class TransformerLayer(torch.nn.Module):
             if hasattr(child, "set_tensor_parallel_group"):
                 child.set_tensor_parallel_group(tp_group)
 
-    def set_context_parallel_running(
+    def set_context_parallel_group(
         self,
         cp_group: Union[dist_group_type, None],
-        cp_global_ranks: Union[int],
+        cp_global_ranks: List[int],
         cp_stream: torch.cuda.Stream,
     ) -> None:
-        """Set CP group and CP dual-stream running"""
+        """
+        Set the context parallel attributes for the given
+        module before executing the forward pass.
+
+        Parameters
+        ----------
+        cp_group : ProcessGroup
+                  context parallel process group.
+        cp_global_ranks : List[int]
+                         list of global ranks in the context group.
+        cp_stream : torch.cuda.Stream
+                   cuda stream for context parallel execution.
+        """
         # Deep iterate but skip self to avoid infinite recursion.
         for index, child in enumerate(self.modules()):
             if index == 0:
                 continue
-            if hasattr(child, "set_context_parallel_running"):
-                child.set_context_parallel_running(cp_group, cp_global_ranks, cp_stream)
+            if hasattr(child, "set_context_parallel_group"):
+                child.set_context_parallel_group(cp_group, cp_global_ranks, cp_stream)
 
     def forward(
         self,
@@ -449,7 +476,7 @@ class TransformerLayer(torch.nn.Module):
         enc_dec_attn_mask: Optional[torch.Tensor] = None,
         is_first_microbatch: Optional[bool] = None,
         checkpoint_core_attention: bool = False,
-        inference_params: Optional[Any] = None,
+        inference_params: Optional[InferenceParams] = None,
         rotary_pos_emb: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
         core_attention_bias_type: str = "no_bias",
         core_attention_bias: Optional[torch.Tensor] = None,
@@ -460,16 +487,17 @@ class TransformerLayer(torch.nn.Module):
 
         .. note::
 
-            Argument :attr:`attention_mask` will be ignored when :attr:`self_attn_mask_type`
-            is set to `"causal"`.
+            Argument :attr:`attention_mask` is only used when :attr:`self_attn_mask_type`
+            includes `"padding"` or `"arbitrary"`.
 
         Parameters
         ----------
         hidden_states : torch.Tensor
              Input tensor.
-        attention_mask : Optional[torch.Tensor], default = `None`
-             Boolean tensor used to mask out self-attention softmax input.
-        self_attn_mask_type: {'causal', 'padding', 'no_mask'}, default = `causal`
+        attention_mask : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], default = `None`
+                        Boolean tensor used to mask out self-attention softmax input.
+                        Can be a tuple of 2 masks for cross attention with padding masks.
+        self_attn_mask_type: {'causal', 'padding', 'no_mask', 'arbitrary'}, default = `causal`
                             type of attention mask passed into softmax operation.
         encoder_output : Optional[torch.Tensor], default = `None`
              Output of the encoder block to be fed into the decoder block if using
@@ -504,6 +532,9 @@ class TransformerLayer(torch.nn.Module):
                     Bias tensor for Q * K.T
         fast_zero_fill: bool, default = `True`
                     Whether to set output tensors to 0 or not before use.
+        inference_params: InferenceParams, default = None
+                         Inference parameters that are passed to the main model in order
+                         to efficienly calculate and store the context during inference.
         """
 
         if self_attn_mask_type is None:

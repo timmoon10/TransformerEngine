@@ -5,7 +5,7 @@
  ************************************************************************/
 
 #include "common.h"
-#include "../common.h"
+#include "common/common.h"
 
 NVTE_Fused_Attn_Backend get_fused_attn_backend(
                 const transformer_engine::DType q_dtype,
@@ -179,6 +179,32 @@ void te_gemm(at::Tensor A,
              int math_sm_count
 );
 
+void te_atomic_gemm(at::Tensor A,
+                    at::Tensor A_scale_inverse,
+                    transformer_engine::DType A_type,
+                    bool transa,
+                    at::Tensor B,
+                    at::Tensor B_scale_inverse,
+                    transformer_engine::DType B_type,
+                    bool transb,
+                    at::Tensor D,
+                    at::Tensor D_scale,
+                    transformer_engine::DType D_type,
+                    at::Tensor D_amax,
+                    at::Tensor bias,
+                    transformer_engine::DType bias_type,
+                    at::Tensor pre_gelu_out,
+                    bool grad,
+                    at::Tensor workspace,
+                    size_t workspaceSize,
+                    bool accumulate,
+                    bool use_split_accumulator,
+                    int math_sm_count,
+                    int m_split,
+                    int n_split,
+                    bool gemm_producer,
+                    at::Tensor counter
+);
 
 void fused_cast_transpose(at::Tensor input,
                           at::Tensor scale,
@@ -497,6 +523,8 @@ at::Tensor scaled_upper_triang_masked_softmax_backward(at::Tensor output_grads_,
 );
 
 size_t get_cublasLt_version();
+
+size_t get_cudnn_version();
 
 bool userbuf_comm_available();
 

@@ -38,6 +38,16 @@ ENABLE_FP8 = [False, True]
 FP8_FORMATS = [Format.E4M3, Format.HYBRID]
 
 
+@pytest.fixture(autouse=True, scope='function')
+def clear_live_arrays():
+    """
+    Clear all live arrays to keep the resource clean
+    """
+    yield
+    for arr in jax.live_arrays():
+        arr.delete()
+
+
 def compare_dict(ref_fd, test_fd, rtol=1e-05, atol=1e-08):
     for key in ref_fd:
         assert key in test_fd, \
@@ -957,6 +967,7 @@ class TestTransformer(TestLayer):
         layernorm_type = attrs[TransformerLayerAttr.LN_TYPE]
         hidden_dropout = 0.0
         attention_dropout = 0.0
+        intermediate_dropout = 0.0
         mlp_activations = attrs[TransformerLayerAttr.ACTIVATION]
         kernel_init = WeightInit.Gaussian(1.0)
         use_bias = attrs[TransformerLayerAttr.USE_BIAS]
@@ -991,6 +1002,7 @@ class TestTransformer(TestLayer):
                                      layernorm_type=layernorm_type,
                                      hidden_dropout=hidden_dropout,
                                      attention_dropout=attention_dropout,
+                                     intermediate_dropout=intermediate_dropout,
                                      mlp_activations=mlp_activations,
                                      use_bias=use_bias,
                                      bias_init=bias_init,
@@ -1007,6 +1019,7 @@ class TestTransformer(TestLayer):
                            layernorm_type=layernorm_type,
                            hidden_dropout=hidden_dropout,
                            attention_dropout=attention_dropout,
+                           intermediate_dropout=intermediate_dropout,
                            mlp_activations=mlp_activations,
                            mha_kernel_init=TransformerEngineBaseLayer.generate_params_init(
                                "mha_kernel", kernel_init),
