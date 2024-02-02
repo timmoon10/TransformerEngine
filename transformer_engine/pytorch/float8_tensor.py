@@ -456,11 +456,9 @@ class Float8Tensor(torch.Tensor):
               The second dimension to be transposed
         update_cache: bool, default = False
                       If `True`, the transpose is computed and stored
-                      in a cache. If `False`, a cached version is
-                      returned if available and otherwise the
-                      transpose is computed. Caching is only supported
-                      for basic 2D transposes and the cache is reset
-                      after any in-place operations.
+                      in a cache if not already cached. Caching is
+                      only supported for basic 2D transposes and the
+                      cache is reset after any in-place operations.
 
         """
 
@@ -476,10 +474,6 @@ class Float8Tensor(torch.Tensor):
                     f"(ndims={self.dim()}, dim0={dim0}, dim1={dim1})"
                 )
             return super().transpose(dim0, dim1)
-
-        # Clear cache if needed
-        if update_cache:
-            self._transpose = None
 
         # Compute transpose if needed
         out = self._transpose
