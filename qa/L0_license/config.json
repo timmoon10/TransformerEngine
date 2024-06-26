@@ -9,6 +9,7 @@
                 "Dockerfile.devel",
                 "Dockerfile.docs",
                 "docker-build.sh",
+                "build_tools/build",
                 ".png",
                 ".ipynb",
                 "docs/Makefile",
