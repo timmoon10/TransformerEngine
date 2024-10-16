@@ -233,13 +233,7 @@ class TorchDotProductAttention(torch.nn.Module):
         value_layer = value_layer.reshape(value_layer.size(0), output_size[0] * output_size[1], -1)
 
         # change view [b * np, sq, sk]
-<<<<<<< HEAD
-        attention_probs = attention_probs.reshape(
-            output_size[0] * output_size[1], output_size[2], -1
-        )
-=======
         attention_probs = attention_probs.reshape(output_size[0] * output_size[1], output_size[2], -1)
->>>>>>> update torch.cuda
 
         # matmul: [b * np, sq, hn]
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))

@@ -222,12 +222,7 @@ def run_dpa_with_cp(
         seq_idx = torch.tensor([rank, 2 * world_size - rank - 1], device=q_.device)
         q_, k_, v_, dout_ = [x.index_select(seq_dim, seq_idx) for x in [q_, k_, v_, dout_]]
         q_, k_, v_, dout_ = [
-<<<<<<< HEAD
-            x.reshape(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :])
-            for x in [q_, k_, v_, dout_]
-=======
             x.reshape(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :]) for x in [q_, k_, v_, dout_]
->>>>>>> update torch.cuda
         ]
     elif qkv_format == "thd":
         seq_idx_q = tex.thd_get_partitioned_indices(
