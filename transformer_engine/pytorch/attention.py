@@ -1600,7 +1600,9 @@ def flash_attn_a2a_communicate(
                     )
                     # [b, cp*2, s//2, np//cp, hn] -> [b, cp*s, np//cp, hn]
                     # or [cp*2, s//2, b, np//cp, hn] -> [cp*s, b, np//cp, hn]
-                    a2a_outputs[i - 2] = x.reshape(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :])
+                    a2a_outputs[i - 2] = x.reshape(
+                        *x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :]
+                    )
             if i < len(a2a_inputs):
                 x = a2a_inputs[i]
                 # [b, s, np, hn] -> [b, s, cp, np//cp, hn]
@@ -1786,7 +1788,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         if causal:
             if qkv_format == "bshd":
                 # [b, s, np, hn] -> [b, 2, s//2, np, hn]
-                q, k, v = [x.reshape(x.shape[0], 2, x.shape[1] // 2, *x.shape[2:]) for x in [q, k, v]]
+                q, k, v = [
+                    x.reshape(x.shape[0], 2, x.shape[1] // 2, *x.shape[2:]) for x in [q, k, v]
+                ]
             elif qkv_format == "sbhd":
                 # [s, b, np, hn] -> [2, s//2, b, np, hn]
                 q, k, v = [x.reshape(2, x.shape[0] // 2, *x.shape[1:]) for x in [q, k, v]]
@@ -4914,7 +4918,9 @@ class UnfusedDotProductAttention(torch.nn.Module):
         value_layer = value_layer.reshape(value_layer.size(0), output_size[0] * output_size[1], -1)
 
         # change view [b * np, sq, sk]
-        attention_probs = attention_probs.reshape(output_size[0] * output_size[1], output_size[2], -1)
+        attention_probs = attention_probs.reshape(
+            output_size[0] * output_size[1], output_size[2], -1
+        )
 
         # matmul: [b * np, sq, hn]
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
@@ -5985,9 +5991,9 @@ class FusedAttnFunc_kvpacked(torch.autograd.Function):
                     "qkv layout should conform to hd_2hd or hd_h2d, e.g. sbhd_sb2hd, "
                     f"but found {qkv_layout}."
                 )
-                q_fp8 = cast_to_fp8(q, fp8_meta["scaling_fwd"], META_QKV, fp8_dtype_forward).reshape(
-                    q.shape
-                )
+                q_fp8 = cast_to_fp8(
+                    q, fp8_meta["scaling_fwd"], META_QKV, fp8_dtype_forward
+                ).reshape(q.shape)
                 kv_c = kv.reshape(-1, kv.shape[-3] * kv.shape[-2] * kv.shape[-1])
                 kv_fp8 = cast_to_fp8(
                     kv_c, fp8_meta["scaling_fwd"], META_QKV, fp8_dtype_forward
