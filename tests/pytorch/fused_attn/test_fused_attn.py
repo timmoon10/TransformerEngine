@@ -1845,9 +1845,13 @@ def _run_ref_mha_f16(dtype, config, backend):
     cu_seqlens = torch.zeros(config.batch_size + 1, device="cuda", dtype=torch.int32)
     cu_seqlens[1:] = torch.cumsum(seqlens, dim=0)
     out_grad = (
+<<<<<<< HEAD
         torch.load("out_grad.pt")
         .to(device="cuda")
         .reshape(config.batch_size, config.max_seqlen_q, -1)
+=======
+        torch.load("out_grad.pt").to(device="cuda").reshape(config.batch_size, config.max_seqlen_q, -1)
+>>>>>>> update torch.cuda
     )
 
     _DUMMY_CUDA_RNG_STATE_TRACKER = CudaRNGStatesTracker()
