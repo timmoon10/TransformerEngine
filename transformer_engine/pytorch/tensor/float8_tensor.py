@@ -241,9 +241,9 @@ class _ViewFunc(torch.autograd.Function):
         if isinstance(tensor, Float8Tensor):
             return Float8Tensor.make_like(
                 tensor,
-                data=tensor._data.reshape(*shape),
+                data=tensor._data.view(*shape),
             )
-        return tensor.reshape(*shape)
+        return tensor.view(*shape)
 
     @staticmethod
     def backward(
@@ -255,10 +255,10 @@ class _ViewFunc(torch.autograd.Function):
         if isinstance(grad, Float8Tensor):
             dgrad = Float8Tensor.make_like(
                 grad,
-                data=grad._data.reshape(ctx.shape),
+                data=grad._data.view(ctx.shape),
             )
             return dgrad, None
-        return grad.reshape(ctx.shape), None
+        return grad.view(ctx.shape), None
 
 
 class _ReshapeFunc(torch.autograd.Function):
@@ -285,7 +285,7 @@ class _ReshapeFunc(torch.autograd.Function):
         if isinstance(tensor, Float8Tensor):
             return Float8Tensor.make_like(
                 tensor,
-                data=tensor._data.view(*shape),
+                data=tensor._data.reshape(*shape),
             )
         return tensor.view(*shape)
 
@@ -299,10 +299,10 @@ class _ReshapeFunc(torch.autograd.Function):
         if isinstance(grad, Float8Tensor):
             dgrad = Float8Tensor.make_like(
                 grad,
-                data=grad._data.view(ctx.shape),
+                data=grad._data.reshape(ctx.shape),
             )
             return dgrad, None
-        return grad.view(ctx.shape), None
+        return grad.reshape(ctx.shape), None
 
 
 class Float8Tensor(QuantizedTensor):
