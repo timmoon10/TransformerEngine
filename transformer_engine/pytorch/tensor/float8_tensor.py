@@ -287,7 +287,7 @@ class _ReshapeFunc(torch.autograd.Function):
                 tensor,
                 data=tensor._data.reshape(*shape),
             )
-        return tensor.view(*shape)
+        return tensor.reshape(*shape)
 
     @staticmethod
     def backward(
