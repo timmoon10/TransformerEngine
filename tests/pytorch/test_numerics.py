@@ -214,7 +214,7 @@ class TorchDotProductAttention(torch.nn.Module):
         )
 
         # change view to [b, np, sq, sk]
-        attention_scores = matmul_result.reshape(*output_size)
+        attention_scores = matmul_result.view(*output_size)
 
         # attention scores and attention mask [b, np, sq, sk]
         attention_probs = self.scale_mask_softmax(attention_scores, attention_mask)
@@ -233,7 +233,7 @@ class TorchDotProductAttention(torch.nn.Module):
         value_layer = value_layer.reshape(value_layer.size(0), output_size[0] * output_size[1], -1)
 
         # change view [b * np, sq, sk]
-        attention_probs = attention_probs.reshape(output_size[0] * output_size[1], output_size[2], -1)
+        attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
 
         # matmul: [b * np, sq, hn]
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
