@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * See LICENSE for license information.
  ************************************************************************/
@@ -69,6 +69,8 @@ void performTest(const size_t N, const size_t H) {
   if (isFp8Type(otype)) {
     auto [atol_amax, rtol_amax] = getTolerances(DType::kFloat32);
     compareResults("amax", output_c.amax(), ref_amax, atol_amax, rtol_amax);
+    float ref_scale_inv = 1.f / output_c.scale();
+    compareResults("scale_inv", output_c.scale_inv(), ref_scale_inv, atol_amax, rtol_amax);
   }
   auto [atol, rtol] = getTolerances(otype);
   compareResults("output_c", output_c, ref_output_c.get(), atol, rtol);
@@ -81,7 +83,10 @@ std::vector<std::pair<size_t, size_t>> test_cases = {{2048, 12288},
                                                      {65536, 128},
                                                      {256, 256},
                                                      {120, 2080},
-                                                     {8, 8}};
+                                                     {8, 8},
+                                                     {1, 3221},       // Prime 456
+                                                     {2333, 1},       // Prime 345
+                                                     {1481, 677}};    // Primes 234, 123
 }  // namespace
 
 class CTTestSuite : public ::testing::TestWithParam<std::tuple<transformer_engine::DType,

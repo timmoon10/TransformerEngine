@@ -1,8 +1,9 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
 from collections.abc import Iterable
+import io
 from typing import Any, Dict, List, Tuple, Union
 
 import pytest
@@ -12,7 +13,7 @@ import transformer_engine.common.recipe
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch.float8_tensor import Float8Tensor
 from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
-import transformer_engine_extensions as tex
+import transformer_engine_torch as tex
 
 # PyTorch tensor dtypes
 _dtypes: List[torch.dtype] = [torch.float32, torch.float16, torch.bfloat16]
@@ -25,6 +26,7 @@ _tols: Dict[tex.DType, Dict[str, float]] = {
     tex.DType.kFloat8E5M2: dict(rtol=0.25, atol=0.125),  # epsilon = 0.125
 }
 
+
 def _to_list(x: Union[Iterable, Any]) -> List:
     """Convert to list if iterable, otherwise put in singleton list"""
     if isinstance(x, Iterable):
@@ -32,11 +34,13 @@ def _to_list(x: Union[Iterable, Any]) -> List:
     else:
         return [x]
 
+
 # Types that can be interpreted as tensor dims
 DimsType = Union[Iterable[int], int]
 
 # Check if FP8 is supported
 fp8_available, reason_for_no_fp8 = FP8GlobalStateManager.is_fp8_available()
+
 
 @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
 class TestFloat8Tensor:
@@ -85,7 +89,7 @@ class TestFloat8Tensor:
             fp8_dtype=fp8_dtype,
             scale=torch.full([1], scale),
         )
-        x_fp8 = x_fp8.from_float8().cpu()
+        x_fp8 = x_fp8.dequantize().cpu()
 
         # Check results
         torch.testing.assert_close(x_fp8, x_ref, **_tols[fp8_dtype])
@@ -107,7 +111,7 @@ class TestFloat8Tensor:
     def test_quantize_dequantize_scales(self, scale: float) -> None:
         self._test_quantize_dequantize(scale=scale)
 
-    @pytest.mark.parametrize("dims", [[], 1, 311, [7,11], [7,5,3], [2,3,5,3]])
+    @pytest.mark.parametrize("dims", [[], 1, 311, [7, 11], [7, 5, 3], [2, 3, 5, 3]])
     def test_quantize_dequantize_dims(self, dims: DimsType) -> None:
         self._test_quantize_dequantize(dims=dims)
 
@@ -140,7 +144,7 @@ class TestFloat8Tensor:
             fp8_meta=fp8_meta,
             fp8_meta_index=fp8_meta_index,
         )
-        x_ref = x_fp8.from_float8()
+        x_ref = x_fp8.dequantize()
         assert list(x_fp8.size()) == dims, "Incorrect dims"
         assert x_fp8.dtype == dtype, "Incorrect nominal dtype"
         assert x_fp8.is_cuda, "Incorrect device"
@@ -190,8 +194,8 @@ class TestFloat8Tensor:
             fp8_dtype=fp8_dtype,
             scale=torch.full([1], scale),
         )
-        x_ref = x_fp8.from_float8()
-        y_ref = y_fp8.from_float8()
+        x_ref = x_fp8.dequantize()
+        y_ref = y_fp8.dequantize()
 
         # Exact operations
         torch.testing.assert_close(-x_fp8, -x_ref, rtol=0, atol=0)
@@ -233,40 +237,86 @@ class TestFloat8Tensor:
             fp8_dtype=fp8_dtype,
             scale=torch.full([1], scale),
         )
-        x_ref = x_fp8.from_float8()
-        y_ref = y_fp8.from_float8()
+        x_ref = x_fp8.dequantize()
+        y_ref = y_fp8.dequantize()
 
         # In-place operations
         tols = _tols[fp8_dtype]
         x_fp8 += y_ref
         x_ref += y_ref
         torch.testing.assert_close(x_fp8, x_ref, **tols)
-        x_ref = x_fp8.from_float8()
+        x_ref = x_fp8.dequantize()
         x_fp8 -= y_fp8
         x_ref -= y_fp8
         torch.testing.assert_close(x_fp8, x_ref, **tols)
-        x_ref = x_fp8.from_float8()
+        x_ref = x_fp8.dequantize()
         x_fp8 *= 2
         x_ref *= 2
         torch.testing.assert_close(x_fp8, x_ref, **tols)
-        x_ref = x_fp8.from_float8()
+        x_ref = x_fp8.dequantize()
 
         # Make sure we are not trivially passing tests
         x_ref += 123
         with pytest.raises(AssertionError):
             torch.testing.assert_close(x_fp8, x_ref, **tols)
 
-    @pytest.mark.parametrize("dims", [[33, 41], [5, 7, 11]])
-    @pytest.mark.parametrize("transpose_dims", [(0, 1), (-2, -1), (0, 0)])
+    @pytest.mark.parametrize("dims", [[33, 41], [7, 11]])
     def test_transpose(
         self,
         dims: DimsType,
-        transpose_dims: Tuple[int, int],
         fp8_dtype: tex.DType = tex.DType.kFloat8E4M3,
-        scale: float = 1,
+        scale: float = 0.5,
         dtype: torch.dtype = torch.float32,
     ) -> None:
         """Test transpose"""
+
+        # Initialize random data
+        dims = _to_list(dims)
+        x = 2 * torch.rand(dims, dtype=dtype, device="cpu") - 1
+        x_fp8 = Float8Tensor.to_float8(
+            x,
+            fp8_dtype=fp8_dtype,
+            scale=torch.full([1], scale),
+        )
+        x = x_fp8.dequantize()
+
+        # Perform transpose
+        x_fp8_t = x_fp8.transpose_2d()
+        x_t = x.transpose(0, 1)
+        x_fp8_t = Float8Tensor.make_like(x_fp8, data=x_fp8_t)
+
+        # Check results
+        tols = dict(rtol=0, atol=0)
+        torch.testing.assert_close(x_fp8_t, x_t, **tols)
+
+        # Make sure we are not trivially passing the test
+        with pytest.raises(AssertionError):
+            torch.testing.assert_close(x_fp8_t, x, **tols)
+
+        # Caching test
+        assert x_fp8._transpose_invalid, "Transpose cache must be invalid when not caching."
+        x_fp8 += 0.5
+        x = x_fp8.dequantize()
+        x_fp8_t = Float8Tensor.make_like(x_fp8, data=x_fp8.transpose_2d(fill_cache=True))
+        x_t = x.transpose(0, 1)
+        torch.testing.assert_close(x_fp8_t, x_t, **tols)
+        assert not x_fp8._transpose_invalid, "Transpose cache reset incorrectly."
+
+        # Inplace update test
+        x_fp8 += 0.5
+        assert not x_fp8._transpose_invalid, "Transpose cache reset incorrectly."
+        x = x_fp8.dequantize()
+        x_fp8_t = Float8Tensor.make_like(x_fp8, data=x_fp8._transpose)
+        x_t = x.transpose(0, 1)
+        torch.testing.assert_close(x_fp8_t, x_t, **tols)
+
+    def test_serialization(
+        self,
+        dims: DimsType = [2, 3, 5],
+        fp8_dtype: tex.DType = tex.DType.kFloat8E4M3,
+        scale: float = 0.5,
+        dtype: torch.dtype = torch.float32,
+    ):
 
         # Initialize random data
         dims = _to_list(dims)
@@ -276,43 +326,72 @@ class TestFloat8Tensor:
             fp8_dtype=fp8_dtype,
             scale=torch.full([1], scale),
         )
-        x_ref = x_fp8.from_float8()
+        x_ref = x_fp8.dequantize()
 
-        # Perform transpose
-        y_fp8 = x_fp8.transpose(*transpose_dims)
-        y_ref = x_ref.transpose(*transpose_dims)
+        # Serialize tensor
+        byte_stream = io.BytesIO()
+        torch.save(x_fp8, byte_stream)
+        x_bytes = byte_stream.getvalue()
+
+        # Mess up and delete old tensor
+        x_fp8._data.zero_()
+        x_fp8._scale_inv.zero_()
+        del x_fp8, byte_stream
+
+        # Deserialize tensor
+        x_fp8 = torch.load(io.BytesIO(x_bytes))
+        del x_bytes
 
         # Check results
         tols = dict(rtol=0, atol=0)
-        torch.testing.assert_close(y_fp8, y_ref, **tols)
+        torch.testing.assert_close(x_fp8, x_ref, **tols)
 
-        # Make sure we are not trivially passing the test
-        if transpose_dims[0] != transpose_dims[1]:
-            with pytest.raises(AssertionError):
-                torch.testing.assert_close(
-                    y_fp8,
-                    x_ref,
-                    **tols,
-                )
+        # Make sure we are not trivially passing tests
+        x_fp8._data.zero_()
+        x_fp8._scale_inv.zero_()
+        with pytest.raises(AssertionError):
+            torch.testing.assert_close(x_fp8, x_ref, **tols)
 
-        # Check transpose caching
-        if x_fp8.dim() == 2 and transpose_dims[0] != transpose_dims[1]:
-            x_fp8 += 0.5
-            x_ref = x_fp8.from_float8()
-            torch.testing.assert_close(
-                x_fp8.transpose(*transpose_dims, update_cache=True),
-                x_ref.transpose(*transpose_dims),
-                **tols,
-            )
-            torch.testing.assert_close(
-                x_fp8.transpose(*transpose_dims, update_cache=True),
-                x_ref.transpose(*transpose_dims),
-                **tols,
-            )
-            x_fp8 += 0.5
-            x_ref = x_fp8.from_float8()
-            torch.testing.assert_close(
-                x_fp8.transpose(*transpose_dims, update_cache=True),
-                x_ref.transpose(*transpose_dims),
-                **tols,
-            )
+    def test_set_data(self):
+        """Test directly setting .data attr"""
+
+        # Initialize Float8Tensor
+        x0 = torch.zeros(4, dtype=torch.float32)
+        x = Float8Tensor.to_float8(x0)
+        assert isinstance(x, Float8Tensor)
+        assert x0.size() == x.size() == x._data.size()
+        assert x.dtype == torch.float32
+        assert x.is_cuda and x._data.is_cuda
+        y = x.dequantize()
+        assert not isinstance(y, Float8Tensor)
+        assert x.size() == y.size()
+        assert x.dtype == y.dtype
+        assert x.device == y.device
+
+        # Set data to plain tensor
+        x0 = torch.zeros((3, 2), dtype=torch.float16, device=x.device)
+        x.data = x0
+        assert isinstance(x, Float8Tensor)
+        assert x0.size() == x.size() == x._data.size()
+        assert x0.dtype == x.dtype
+        assert x0.device == x.device == x._data.device
+        y = x.dequantize()
+        assert not isinstance(y, Float8Tensor)
+        assert x.size() == y.size()
+        assert x.dtype == y.dtype
+        assert x.device == y.device
+
+        # Set data to Float8Tensor
+        x0 = Float8Tensor.to_float8(torch.zeros((4, 3, 1), dtype=torch.float32))
+        x.data = x0
+        assert isinstance(x, Float8Tensor)
+        assert x0.size() == x.size() == x._data.size()
+        assert x0.dtype == x.dtype
+        assert x0.device == x.device == x._data.device
+        assert x0._data is x._data
+        assert x0._scale_inv is x._scale_inv
+        y = x.dequantize()
+        assert not isinstance(y, Float8Tensor)
+        assert x.size() == y.size()
+        assert x.dtype == y.dtype
+        assert x.device == y.device

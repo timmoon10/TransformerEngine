@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -6,6 +6,7 @@
 from contextlib import contextmanager
 
 _IN_ONNX_EXPORT_MODE = False
+
 
 @contextmanager
 def onnx_export(
@@ -26,12 +27,13 @@ def onnx_export(
     """
 
     global _IN_ONNX_EXPORT_MODE
-    onnx_export_state = (_IN_ONNX_EXPORT_MODE)
+    onnx_export_state = _IN_ONNX_EXPORT_MODE
     try:
         _IN_ONNX_EXPORT_MODE = enabled
         yield
     finally:
         _IN_ONNX_EXPORT_MODE = onnx_export_state
+
 
 def is_in_onnx_export_mode() -> bool:
     """Returns True if onnx export mode is enabled, False otherwise."""

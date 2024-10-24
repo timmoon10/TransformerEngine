@@ -1,5 +1,5 @@
 ..
-    Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
     See LICENSE for license information.
 
@@ -7,6 +7,9 @@ pyTorch
 =======
 
 .. autoapiclass:: transformer_engine.pytorch.Linear(in_features, out_features, bias=True, **kwargs)
+  :members: forward, set_tensor_parallel_group
+
+.. autoapiclass:: transformer_engine.pytorch.GroupedLinear(in_features, out_features, bias=True, **kwargs)
   :members: forward, set_tensor_parallel_group
 
 .. autoapiclass:: transformer_engine.pytorch.LayerNorm(hidden_size, eps=1e-5, **kwargs)
@@ -40,3 +43,11 @@ pyTorch
 .. autoapifunction:: transformer_engine.pytorch.checkpoint
 
 .. autoapifunction:: transformer_engine.pytorch.onnx_export
+
+.. autoapifunction:: transformer_engine.pytorch.make_graphed_callables
+
+.. autoapifunction:: transformer_engine.pytorch.get_cpu_offload_context
+
+.. autoapifunction:: transformer_engine.pytorch.moe_permute
+
+.. autoapifunction:: transformer_engine.pytorch.moe_unpermute

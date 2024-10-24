@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 """The utilities for Transformer Engine"""
@@ -6,10 +6,12 @@ import inspect
 import warnings
 from enum import Enum
 
-warnings.simplefilter('default')
+warnings.filterwarnings(
+    "module", category=DeprecationWarning, module="transformer_engine.common.utils"
+)
 
 
-class DeprecatedEnum:    # pylint: disable=too-few-public-methods
+class DeprecatedEnum:  # pylint: disable=too-few-public-methods
     """DeprecatedEnum"""
 
     def __init__(self, enum_cls, msg):
@@ -32,7 +34,7 @@ def deprecate_wrapper(obj, msg):
         if issubclass(obj, Enum):
             return DeprecatedEnum(obj, msg)
 
-        class DeprecatedCls(obj):    # pylint: disable=too-few-public-methods
+        class DeprecatedCls(obj):  # pylint: disable=too-few-public-methods
             """DeprecatedCls"""
 
             def __init__(self, *args, **kwargs):
@@ -50,4 +52,5 @@ def deprecate_wrapper(obj, msg):
         return deprecated
 
     raise NotImplementedError(
-        f"deprecate_cls_wrapper only support Class and Function, but got {type(obj)}.")
+        f"deprecate_cls_wrapper only support Class and Function, but got {type(obj)}."
+    )

@@ -1,16 +1,19 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 """Transformer"""
 
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
+import warnings
 
 import paddle
 from paddle.incubate.nn.layer.fused_dropout_add import FusedDropoutAdd
 
-from transformer_engine.paddle.layer import LayerNormMLP, LayerNorm, MultiHeadAttention
-from transformer_engine.paddle.constants import AttnMaskTypes, LayerTypes, dist_group_type
-from transformer_engine.paddle.distributed import get_tp_group_and_world_size, track_rng_state
+from .layernorm_mlp import LayerNormMLP
+from .layernorm import LayerNorm
+from .attention import MultiHeadAttention
+from ..constants import AttnMaskTypes, LayerTypes, dist_group_type
+from ..distributed import get_tp_group_and_world_size, track_rng_state
 
 
 class TransformerLayer(paddle.nn.Layer):
@@ -26,6 +29,14 @@ class TransformerLayer(paddle.nn.Layer):
                      intermediate size to which input samples are projected.
     num_attention_heads : int
                          number of attention heads in the transformer layer.
+    num_gqa_groups : Optional[int], default = `None`
+                    number of GQA groups in the transformer layer.
+                    Grouped Query Attention is described in
+                    `this paper <https://arxiv.org/pdf/2305.13245.pdf>`_.
+                    This only affects the keys and values, not the queries.
+                    GQA-1 is equivalent to Multi-Query Attention
+                    (`MQA <https://arxiv.org/pdf/1911.02150.pdf>`_), while GQA-H
+                    is equivalent to MHA, i.e. `num_gqa_groups = num_attention_heads`.
     layernorm_epsilon : float, default = 1e-5
                        a value added to the denominator of layer normalization
                        for numerical stability.
@@ -51,6 +62,7 @@ class TransformerLayer(paddle.nn.Layer):
                if set to `decoder`, an additional cross-attn block is added after self-attn.
                This can be used for structures like `T5` Transformer in conjunction with the
                `encoder` option.
+    normalization: {'LayerNorm', 'RMSNorm'}, default = `LayerNorm`
     zero_centered_gamma : bool, default = 'False'
                          if set to 'True', gamma parameter in LayerNorm is initialized to 0 and
                          the LayerNorm formula changes to
@@ -75,6 +87,8 @@ class TransformerLayer(paddle.nn.Layer):
                       if set to `True`, QKV and FC1 layers are used as Column Parallel
                       whereas PROJ and FC2 is used as Row Parallel as described
                       `here <https://arxiv.org/pdf/1909.08053.pdf>`_.
+    sequence_parallel : bool, default = `False`
+                       if set to `True`, uses sequence parallelism.
     tp_group : ProcessGroup, default = `None`
               tensor parallel process group.
     attention_dropout_rng_state_name : str, default = `local_seed`
@@ -88,29 +102,46 @@ class TransformerLayer(paddle.nn.Layer):
                    specified name should be registered through
                    `paddle.distributed.fleet.meta_parallel.get_rng_state_tracker()
                    .add(rng_state_name, seed)`.
+
+    Optimization parameters
+    -----------------------
+    fuse_wgrad_accumulation : bool, default = 'False'
+                             if set to `True`, enables fusing of creation and accumulation of
+                             the weight gradient. When enabled, it is assumed that the weights
+                             have an additional `main_grad` attribute (used instead of the
+                             regular `grad`) which is a pre-allocated buffer of the correct
+                             size to accumulate gradients in.
+
     """
 
-    def __init__(self,
-                 hidden_size: int,
-                 ffn_hidden_size: int,
-                 num_attention_heads: int,
-                 layernorm_epsilon: float = 1e-5,
-                 hidden_dropout: float = 0.1,
-                 attention_dropout: float = 0.1,
-                 weight_attr: Union[paddle.ParamAttr, None] = None,
-                 bias_attr: Union[paddle.ParamAttr, None, bool] = None,
-                 self_attn_mask_type: str = "causal",
-                 params_dtype: Optional[paddle.dtype] = None,
-                 apply_residual_connection_post_layernorm: bool = False,
-                 output_layernorm: bool = False,
-                 layer_type: str = "encoder",
-                 zero_centered_gamma: bool = False,
-                 activation: str = 'gelu',
-                 set_parallel_mode: bool = False,
-                 tp_group: Optional[dist_group_type] = None,
-                 attention_dropout_rng_state_name: str = 'local_seed',
-                 hidden_dropout_rng_state_name: str = 'global_seed',
-                 backend: str = 'transformer_engine') -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        ffn_hidden_size: int,
+        num_attention_heads: int,
+        num_gqa_groups: Optional[int] = None,
+        layernorm_epsilon: float = 1e-5,
+        hidden_dropout: float = 0.1,
+        attention_dropout: float = 0.1,
+        weight_attr: Union[paddle.ParamAttr, None] = None,
+        bias_attr: Union[paddle.ParamAttr, None, bool] = None,
+        max_sequence_length: Optional[int] = None,
+        self_attn_mask_type: str = "causal",
+        params_dtype: Optional[paddle.dtype] = None,
+        apply_residual_connection_post_layernorm: bool = False,
+        output_layernorm: bool = False,
+        layer_type: str = "encoder",
+        normalization: str = "LayerNorm",
+        zero_centered_gamma: bool = False,
+        activation: str = "gelu",
+        set_parallel_mode: bool = False,
+        sequence_parallel: bool = False,
+        tp_group: Optional[dist_group_type] = None,
+        fuse_wgrad_accumulation: bool = False,
+        attention_dropout_rng_state_name: str = "local_seed",
+        hidden_dropout_rng_state_name: str = "global_seed",
+        backend: str = "transformer_engine",
+    ) -> None:
         super().__init__()
 
         params_dtype = paddle.get_default_dtype() if params_dtype is None else params_dtype
@@ -119,13 +150,23 @@ class TransformerLayer(paddle.nn.Layer):
         self.apply_residual_connection_post_layernorm = apply_residual_connection_post_layernorm
         self.self_attn_mask_type = self_attn_mask_type
         self.set_parallel_mode = set_parallel_mode
-        self.tp_group, self.tp_size = get_tp_group_and_world_size(tp_group,
-                                                                  enable_tp=set_parallel_mode)
+        self.tp_group, self.tp_size = get_tp_group_and_world_size(
+            tp_group, enable_tp=set_parallel_mode
+        )
         self.tensor_parallel = self.tp_size > 1
+        self.sequence_parallel = self.tensor_parallel and sequence_parallel
         self.hidden_dropout_rng_state_name = hidden_dropout_rng_state_name
+        # SP needs local seed for hidden dropout
+        if self.sequence_parallel and self.hidden_dropout_rng_state_name == "global_seed":
+            warnings.warn(
+                "RNG state for hidden dropout needs to be different across TP ranks. "
+                "Forcing hidden_dropout_rng_state_name to 'local_seed'"
+            )
+            self.hidden_dropout_rng_state_name = "local_seed"
 
-        assert (self_attn_mask_type
-                in AttnMaskTypes), f"self_attn_mask_type {self_attn_mask_type} not supported"
+        assert (
+            self_attn_mask_type in AttnMaskTypes
+        ), f"self_attn_mask_type {self_attn_mask_type} not supported"
         assert layer_type in LayerTypes, f"layer_type {layer_type} not supported"
 
         attention_args = (
@@ -139,9 +180,14 @@ class TransformerLayer(paddle.nn.Layer):
         common_attention_kwargs = {
             "params_dtype": params_dtype,
             "return_layernorm_output": apply_residual_connection_post_layernorm,
+            "normalization": normalization,
             "zero_centered_gamma": zero_centered_gamma,
             "set_parallel_mode": set_parallel_mode,
+            "sequence_parallel": self.sequence_parallel,
+            "max_sequence_length": max_sequence_length,
             "tp_group": tp_group,
+            "num_gqa_groups": num_gqa_groups,
+            "fuse_wgrad_accumulation": fuse_wgrad_accumulation,
             "rng_state_name": attention_dropout_rng_state_name,
             "backend": backend,
         }
@@ -169,11 +215,14 @@ class TransformerLayer(paddle.nn.Layer):
             eps=layernorm_epsilon,
             weight_attr=weight_attr,
             bias_attr=bias_attr,
+            normalization=normalization,
             activation=activation,
             return_layernorm_output=apply_residual_connection_post_layernorm,
             zero_centered_gamma=zero_centered_gamma,
             set_parallel_mode=set_parallel_mode,
+            sequence_parallel=self.sequence_parallel,
             tp_group=tp_group,
+            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
             backend=backend,
         )
 
@@ -186,6 +235,7 @@ class TransformerLayer(paddle.nn.Layer):
                 weight_attr,
                 bias_attr,
                 zero_centered_gamma=zero_centered_gamma,
+                sequence_parallel=self.sequence_parallel,
                 backend=backend,
             )
 
@@ -200,10 +250,12 @@ class TransformerLayer(paddle.nn.Layer):
         attention_mask: Optional[paddle.Tensor] = None,
         encoder_output: Optional[paddle.Tensor] = None,
         enc_dec_attn_mask: Optional[paddle.Tensor] = None,
+        rotary_pos_emb: Optional[Tuple[paddle.Tensor, paddle.Tensor]] = None,
         core_attention_bias_type: str = "no_bias",
         core_attention_bias: Optional[paddle.Tensor] = None,
         set_zero: bool = True,
         recompute_core_attention: bool = False,
+        is_first_microbatch: Optional[bool] = None,
     ) -> paddle.Tensor:
         """
         Transformer Layer: attention block and a feedforward network (MLP)
@@ -225,6 +277,9 @@ class TransformerLayer(paddle.nn.Layer):
         enc_dec_attn_mask : Optional[paddle.Tensor], default = `None`
              Boolean tensor used to mask out inter-attention softmax input if using
              `layer_type="decoder"`.
+        rotary_pos_emb : Optional[Tuple[paddle.Tensor, paddle.Tensor]], default = `None`
+             Embeddings for query and key tensors for applying rotary position
+             embedding. By default no input embedding is applied
         core_attention_bias_type: str, default = `no_bias`
         core_attention_bias: Optional[paddle.Tensor], default = `None`
                     Bias tensor for Q * K.T
@@ -235,13 +290,25 @@ class TransformerLayer(paddle.nn.Layer):
                                   during the backward pass in order to save memory that would
                                   otherwise be occupied to store the forward activations until
                                   backprop.
+        is_first_microbatch : {True, False, None}, default = None
+                             During training using either gradient accumulation or
+                             pipeline parallelism a minibatch of data is further split
+                             into microbatches. Between the microbatches of the same minibatch
+                             the model weights are not updated. Setting this parameter indicates
+                             whether the current microbatch is the first in a minibatch or not.
+                             When set, this parameter enables additional optimizations:
+
+                             * during FP8 training, it allows caching of the FP8 versions of
+                               the weights
         """
 
         if self.self_attn_mask_type != "causal" and attention_mask is not None:
-            assert (attention_mask.dtype == paddle.bool), "Attention mask must be a boolean tensor"
+            assert attention_mask.dtype == paddle.bool, "Attention mask must be a boolean tensor"
 
-        assert core_attention_bias_type in ['no_bias'], f"Only no_bias is supported currently, " \
+        assert core_attention_bias_type in ["no_bias"], (
+            "Only no_bias is supported currently, "
             f"but receive core_attention_bias_type = {core_attention_bias_type}"
+        )
 
         # Self attention.
         self_attention_outputs = self.self_attention(
@@ -250,7 +317,9 @@ class TransformerLayer(paddle.nn.Layer):
             core_attention_bias_type=core_attention_bias_type,
             core_attention_bias=core_attention_bias,
             set_zero=set_zero,
+            rotary_pos_emb=rotary_pos_emb,
             recompute_core_attention=recompute_core_attention,
+            is_first_microbatch=is_first_microbatch,
         )
 
         if self.apply_residual_connection_post_layernorm and not self.output_layernorm:
@@ -273,6 +342,7 @@ class TransformerLayer(paddle.nn.Layer):
                 core_attention_bias=core_attention_bias,
                 set_zero=set_zero,
                 recompute_core_attention=recompute_core_attention,
+                is_first_microbatch=is_first_microbatch,
             )
             if self.apply_residual_connection_post_layernorm:
                 attention_output, residual = inter_attention_outputs
@@ -280,12 +350,13 @@ class TransformerLayer(paddle.nn.Layer):
                 attention_output = inter_attention_outputs
                 residual = bda_output
 
-            with track_rng_state(enable=self.tensor_parallel,
-                                 name=self.hidden_dropout_rng_state_name):
+            with track_rng_state(
+                enable=self.tensor_parallel, name=self.hidden_dropout_rng_state_name
+            ):
                 bda_output = self.fused_dropout_add2(attention_output, residual)
 
         # MLP.
-        mlp_outputs = self.layernorm_mlp(bda_output)
+        mlp_outputs = self.layernorm_mlp(bda_output, is_first_microbatch=is_first_microbatch)
         if self.apply_residual_connection_post_layernorm:
             mlp_output, residual = mlp_outputs
         else:

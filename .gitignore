@@ -9,7 +9,7 @@
 *.ncu-rep
 *.sqlite
 *.onnx
-.eggs
+*.eggs
 build/
 *.so
 *.egg-info
@@ -25,3 +25,18 @@ tests/cpp/build/
 docs/_build
 .ipynb_checkpoints
 docs/doxygen
+*.log
+CMakeFiles/CMakeSystem.cmake
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+develop-eggs/
+dist/
+downloads/
+.pytest_cache/
+compile_commands.json

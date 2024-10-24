@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -16,9 +16,7 @@ def debug(enabled: bool = True) -> None:
     _NUMERICS_DEBUG = enabled
 
 
-def fp8_tensor_statistics(
-    tensor: torch.Tensor, fp8_format: str = "E4M3"
-) -> Tuple[int, ...]:
+def fp8_tensor_statistics(tensor: torch.Tensor, fp8_format: str = "E4M3") -> Tuple[int, ...]:
     """Print FP8 tensor stats"""
     fp8_format = fp8_format.upper()
     assert fp8_format in (

@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * See LICENSE for license information.
  ************************************************************************/
@@ -19,11 +19,11 @@ namespace transformer_engine {
  * returned.
  */
 template <typename T = std::string>
-T getenv(const std::string &variable);
+T getenv(const char *variable);
 
 /*! \brief Get environment variable and convert to type */
 template <typename T = std::string>
-T getenv(const std::string &variable, const T &default_value);
+T getenv(const char *variable, const T &default_value);
 
 /*! \brief Check if a file exists and can be read */
 bool file_exists(const std::string &path);

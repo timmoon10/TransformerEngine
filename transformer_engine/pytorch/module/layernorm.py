@@ -1,20 +1,20 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
 """LayerNorm API"""
 import os
+import warnings
 from typing import Union, Tuple, Optional
 
 import torch
 from torch.nn.parameter import Parameter
 from torch.nn import init
 
-import transformer_engine_extensions as tex
-from .base import TransformerEngineBaseModule
+import transformer_engine_torch as tex
 from ..cpp_extensions import (
     layernorm_fwd_inf,
- )
+)
 from ..jit import no_torch_dynamo
 from ..utils import cast_if_needed
 
@@ -33,10 +33,12 @@ class _LayerNorm(torch.autograd.Function):
         eps: float,
         fwd_ln_sm_margin: int,
         bwd_ln_sm_margin: int,
+        inf_ln_sm_margin: int,
         zero_centered_gamma: bool,
         is_grad_enabled: bool,
         activation_dtype: torch.dtype,
     ) -> torch.Tensor:
+        # pylint: disable=missing-function-docstring
         # Make sure input dimensions are compatible
         in_features = ln_weight.numel()
         assert inp.is_cuda, "TransformerEngine needs CUDA."
@@ -49,29 +51,33 @@ class _LayerNorm(torch.autograd.Function):
         ln_bias = cast_if_needed(ln_bias, activation_dtype)
 
         if is_grad_enabled:
-            ln_out, mu, rsigma = tex.layernorm_fwd(inputmat, ln_weight,
-                ln_bias, eps, fwd_ln_sm_margin, zero_centered_gamma)
+            ln_out, mu, rsigma = tex.layernorm_fwd(
+                inputmat, ln_weight, ln_bias, eps, fwd_ln_sm_margin, zero_centered_gamma
+            )
             ctx.save_for_backward(inputmat, ln_weight, mu, rsigma)
             ctx.inp_shape = inp.shape
             ctx.bwd_ln_sm_margin = bwd_ln_sm_margin
             ctx.zero_centered_gamma = zero_centered_gamma
         else:
-            ln_out, mu, rsigma = layernorm_fwd_inf(inputmat, ln_weight,
-                ln_bias, eps, zero_centered_gamma), None, None
+            ln_out, mu, rsigma = (
+                layernorm_fwd_inf(
+                    inputmat, ln_weight, ln_bias, eps, inf_ln_sm_margin, zero_centered_gamma
+                ),
+                None,
+                None,
+            )
         return ln_out.view_as(inp)
 
     @staticmethod
-    def backward(
-        ctx, grad_output: torch.Tensor
-    ) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
+        # pylint: disable=missing-function-docstring
         inputmat, ln_weight, mu, rsigma = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         d_ln_out = grad_output.view(inputmat.shape)
         dxmat, dgamma, dbeta = tex.layernorm_bwd(
-            d_ln_out, inputmat, mu, rsigma, ln_weight,
-            ctx.bwd_ln_sm_margin, ctx.zero_centered_gamma
+            d_ln_out, inputmat, mu, rsigma, ln_weight, ctx.bwd_ln_sm_margin, ctx.zero_centered_gamma
         )
-        return dxmat.view(ctx.inp_shape), dgamma, dbeta, None, None, None, None, None, None
+        return dxmat.view(ctx.inp_shape), dgamma, dbeta, None, None, None, None, None, None, None
 
 
 class LayerNorm(torch.nn.Module):
@@ -105,7 +111,7 @@ class LayerNorm(torch.nn.Module):
                             y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x] + \varepsilon}} *
                             (1 + \gamma) + \beta
     device : Union[torch.device, str], default = "cuda"
-          The device on which the parameters of the model will allocated. It is the user's
+          The device on which the parameters of the model will be allocated. It is the user's
           responsibility to ensure all parameters are moved to the GPU before running the
           forward pass.
     """
@@ -137,9 +143,10 @@ class LayerNorm(torch.nn.Module):
                 dtype=params_dtype,
             )
         )
-        setattr(self.weight, "sequence_parallel", sequence_parallel)
-        setattr(self.bias, "sequence_parallel", sequence_parallel)
-        self.reset_layer_norm_parameters()
+        self.sequence_parallel = sequence_parallel
+        self.activation_dtype: Optional[torch.dtype] = None
+
+        self.reset_parameters(defer_init=device == "meta")
 
         # These many SMs are subtracted from the total SM count when calling forward
         # and backward LayerNorm C APIs. These envvars can be used to prevent the LN
@@ -147,20 +154,55 @@ class LayerNorm(torch.nn.Module):
         # communication overlap with LN.
         self.fwd_ln_sm_margin = int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
         self.bwd_ln_sm_margin = int(os.getenv("NVTE_BWD_LAYERNORM_SM_MARGIN", "0"))
+        self.inf_ln_sm_margin = int(os.getenv("NVTE_INF_LAYERNORM_SM_MARGIN", "0"))
 
     def reset_layer_norm_parameters(self) -> None:
         """Init LN params"""
+        warnings.warn(
+            "This method will be deprecated in an upcoming release. "
+            "Update your code to use LayerNorm.reset_parameters() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if not self.zero_centered_gamma:
             init.ones_(self.weight)
         else:
             init.zeros_(self.weight)
         init.zeros_(self.bias)
 
-    @no_torch_dynamo
+    def reset_parameters(self, defer_init=False) -> None:
+        """Init LayerNorm parameters"""
+        if defer_init:
+            return
+
+        if self.weight.device == torch.device("meta"):
+            self.weight = torch.nn.Parameter(torch.empty_like(self.weight, device="cuda"))
+        setattr(self.weight, "sequence_parallel", self.sequence_parallel)
+        init.constant_(self.weight, float(not self.zero_centered_gamma))
+
+        if self.bias.device == torch.device("meta"):
+            self.bias = torch.nn.Parameter(torch.empty_like(self.bias, device="cuda"))
+        setattr(self.bias, "sequence_parallel", self.sequence_parallel)
+        init.zeros_(self.bias)
+
+    @no_torch_dynamo()
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
-        """LayerNorm FWD"""
+        # pylint: disable=missing-function-docstring
+
         # Set the activation type for AMP.
-        TransformerEngineBaseModule.set_activation_dtype(self, inp)
+        # Note: This will soon be deprecated with
+        # https://github.com/NVIDIA/TransformerEngine/pull/1033
+        if torch.is_autocast_enabled():
+            self.activation_dtype = torch.get_autocast_gpu_dtype()
+        elif self.activation_dtype != inp.dtype:
+            dtype = inp.dtype
+            for name, param in self.named_parameters():
+                if param is not None:
+                    assert dtype == param.dtype, (
+                        "Data types for parameters must match when outside of autocasted region. "
+                        f" Found input dtype: {dtype} and {name!r} dtype: {param.dtype}"
+                    )
+            self.activation_dtype = dtype
 
         if torch.is_grad_enabled():
             fwd_fn = _LayerNorm.apply
@@ -176,6 +218,7 @@ class LayerNorm(torch.nn.Module):
             self.eps,
             self.fwd_ln_sm_margin,
             self.bwd_ln_sm_margin,
+            self.inf_ln_sm_margin,
             self.zero_centered_gamma,
             torch.is_grad_enabled(),
             self.activation_dtype,

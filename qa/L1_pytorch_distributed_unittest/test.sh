@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -6,8 +6,8 @@ set -e
 
 : ${TE_PATH:=/opt/transformerengine}
 
-git clone https://github.com/NVIDIA/Megatron-LM.git
-cd Megatron-LM
-git checkout f24fac4ed0dcf0522056521a93445d9a82f501a9 
-pytest -v -s $TE_PATH/tests/pytorch/distributed/test_convergence.py
-python $TE_PATH/tests/pytorch/distributed/print_logs.py
+pip install pytest==8.2.1
+pytest -v -s $TE_PATH/tests/pytorch/distributed/test_numerics.py
+pytest -v -s $TE_PATH/tests/pytorch/distributed/test_comm_gemm_overlap.py
+pytest -v -s $TE_PATH/tests/pytorch/distributed/test_fusible_ops.py
+pytest -v -s $TE_PATH/tests/pytorch/fused_attn/test_fused_attn_with_cp.py

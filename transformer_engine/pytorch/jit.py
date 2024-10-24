@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -8,16 +8,30 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
+# pylint: disable=unnecessary-lambda-assignment
+
 jit_fuser = torch.jit.script
 if torch.__version__ >= "2" and bool(int(os.getenv("NVTE_TORCH_COMPILE", "1"))):
     jit_fuser = torch.compile
 
+# See: https://github.com/NVIDIA/TransformerEngine/issues/597
+dropout_fuser = torch.jit.script
+if torch.__version__ >= "2.2" and bool(int(os.getenv("NVTE_TORCH_COMPILE", "1"))):
+    dropout_fuser = torch.compile
+
 # Decorator to disable Torch Dynamo
 # See: https://github.com/NVIDIA/TransformerEngine/issues/308
-no_torch_dynamo = lambda func: func
+no_torch_dynamo = lambda recursive=True: lambda func: func
 if torch.__version__ >= "2":
     import torch._dynamo
-    no_torch_dynamo = torch._dynamo.disable
+
+    if torch.__version__ >= "2.1":
+        no_torch_dynamo = lambda recursive=True: lambda f: torch._dynamo.disable(
+            f, recursive=recursive
+        )
+    else:
+        # no "recursive" option in pyTorch 2.0 - it acts as if recursive was True
+        no_torch_dynamo = lambda recursive=True: torch._dynamo.disable
 
 
 def set_jit_fusion_options() -> None:
@@ -25,7 +39,9 @@ def set_jit_fusion_options() -> None:
     # flags required to enable jit fusion kernels
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
-    if (TORCH_MAJOR > 1) or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10):
+    if TORCH_MAJOR == 2 and TORCH_MINOR >= 2:
+        pass
+    elif (TORCH_MAJOR == 2) or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10):
         # nvfuser
         torch._C._jit_set_profiling_executor(True)
         torch._C._jit_set_profiling_mode(True)
@@ -69,27 +85,25 @@ def bgrad_dgelu_fused_(
     x = inp + bias
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     # sqrt(2/pi) * 3 * 0.044715 -> 0.1070322243
-    ff = 0.5 * x * (
-        (1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)
-    ) + 0.5 * (1 + tanh_out)
+    ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (
+        1 + tanh_out
+    )
     dgelu = ff * grad_output
     bgrad = dgelu.sum(dim=0)
     return bgrad, dgelu
 
 
 @jit_fuser
-def dgelu_fused_(
-    grad_output: torch.Tensor, inp: torch.Tensor
-) -> torch.Tensor:
+def dgelu_fused_(grad_output: torch.Tensor, inp: torch.Tensor) -> torch.Tensor:
     """
     Dgelu fused, this is copy of bgrad_dgelu_fused_ cause jit fusion doesn't allow conditioning.
     """
     x = inp
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     # sqrt(2/pi) * 3 * 0.044715 -> 0.1070322243
-    ff = 0.5 * x * (
-        (1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)
-    ) + 0.5 * (1 + tanh_out)
+    ff = 0.5 * x * ((1 - tanh_out * tanh_out) * (0.79788456 + 0.1070322243 * x * x)) + 0.5 * (
+        1 + tanh_out
+    )
     dgelu = ff * grad_output
     return dgelu
 
@@ -97,7 +111,7 @@ def dgelu_fused_(
 def bias_gelu_fused(inp: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """Disable native AMP for bias_gelu_fused_"""
     with torch.cuda.amp.autocast(enabled=False):
-        if bias.numel() != 0:
+        if bias is not None and bias.numel() != 0:
             return bias_gelu_fused_(inp, bias)
         return gelu_fused_(inp)
 
@@ -107,7 +121,7 @@ def bgrad_dgelu_fused(
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """Disable native AMP for `bgrad_dgelu_fused_`"""
     with torch.cuda.amp.autocast(enabled=False):
-        if bias.numel() != 0:
+        if bias is not None and bias.numel() != 0:
             return bgrad_dgelu_fused_(grad_output, inp, bias)
         return None, dgelu_fused_(grad_output, inp)
 
@@ -134,7 +148,7 @@ def get_bias_dropout_add(training: bool) -> Callable:
     return _bias_dropout_add
 
 
-@torch.jit.script
+@dropout_fuser
 def bias_dropout_add_fused_train_(
     x: torch.Tensor, bias: torch.Tensor, residual: torch.Tensor, prob: float
 ) -> torch.Tensor:
@@ -151,7 +165,7 @@ def bias_dropout_add_fused_train(
             return bias_dropout_add_fused_train_(x, bias, residual, prob)
 
 
-@torch.jit.script
+@dropout_fuser
 def bias_dropout_add_fused_inference_(
     x: torch.Tensor, bias: torch.Tensor, residual: torch.Tensor, prob: float
 ) -> torch.Tensor:
@@ -175,19 +189,13 @@ def warmup_jit_bias_dropout_add(
     # Save cuda RNG state to ensure warmup does not affect reproducibility.
     rng_state = torch.cuda.get_rng_state()
 
-    inp = torch.rand(
-        (seq_length, micro_batch_size, hidden_size), dtype=dtype, device="cuda"
-    )
-    residual = torch.rand(
-        (seq_length, micro_batch_size, hidden_size), dtype=dtype, device="cuda"
-    )
+    inp = torch.rand((seq_length, micro_batch_size, hidden_size), dtype=dtype, device="cuda")
+    residual = torch.rand((seq_length, micro_batch_size, hidden_size), dtype=dtype, device="cuda")
     bias = torch.rand((hidden_size), dtype=dtype, device="cuda")
     dropout_rate = 0.1
     # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation
-    for input_grad, bias_grad, residual_grad in zip(
-        [False, True], [True, True], [True, True]
-    ):
+    for input_grad, bias_grad, residual_grad in zip([False, True], [True, True], [True, True]):
         inp.requires_grad = input_grad
         bias.requires_grad = bias_grad
         residual.requires_grad = residual_grad

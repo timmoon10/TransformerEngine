@@ -1,5 +1,5 @@
 ..
-    Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
     See LICENSE for license information.
 
@@ -30,6 +30,7 @@ Transformer Engine documentation
 
    installation
    examples/quickstart.ipynb
+   faq
 
 .. toctree::
    :hidden:
@@ -44,9 +45,11 @@ Transformer Engine documentation
 
    examples/fp8_primer.ipynb
    examples/advanced_optimizations.ipynb
+   examples/te_llama/tutorial_accelerate_hf_llama_with_te.ipynb
 
 .. toctree::
    :hidden:
    :caption: Advanced
 
    api/c/index
+   examples/attention/attention.ipynb

@@ -1,5 +1,5 @@
 ..
-    Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
     See LICENSE for license information.
 
@@ -8,16 +8,28 @@
 Transformer Engine
 ==================
 
-`Quickstart <#examples>`_ | `Installation <#installation>`_ | `User Guide <https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/index.html>`_ | `Examples <https://github.com/NVIDIA/TransformerEngine/tree/main/examples>`_ | `Model Support <#model-support>`_ | `Integrations <#integrations>`_ | `Release notes <https://docs.nvidia.com/deeplearning/transformer-engine/release-notes/index.html>`_
+`Quickstart <#examples>`_ | `Installation <#installation>`_ | `User Guide <https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/index.html>`_ | `Examples <https://github.com/NVIDIA/TransformerEngine/tree/main/examples>`_ | `FP8 Convergence <#fp8-convergence>`_ | `Integrations <#integrations>`_ | `Release notes <https://docs.nvidia.com/deeplearning/transformer-engine/release-notes/index.html>`_
 
 Latest News
-==================
+===========
 
+* [03/2024] `Turbocharged Training: Optimizing the Databricks Mosaic AI stack with FP8 <https://www.databricks.com/blog/turbocharged-training-optimizing-databricks-mosaic-ai-stack-fp8>`_
+* [03/2024] `FP8 Training Support in SageMaker Model Parallelism Library <https://docs.aws.amazon.com/sagemaker/latest/dg/model-parallel-release-notes.html>`_
+* [12/2023] `New NVIDIA NeMo Framework Features and NVIDIA H200 <https://developer.nvidia.com/blog/new-nvidia-nemo-framework-features-and-nvidia-h200-supercharge-llm-training-performance-and-versatility/>`_
+
+.. image:: docs/examples/H200-NeMo-performance.png
+  :width: 600
+  :alt: H200
+
+* [11/2023] `Inflection-2: The Next Step Up <https://inflection.ai/inflection-2>`_
+* [11/2023] `Unleashing The Power Of Transformers With NVIDIA Transformer Engine <https://lambdalabs.com/blog/unleashing-the-power-of-transformers-with-nvidia-transformer-engine>`_
+* [11/2023] `Accelerating PyTorch Training Workloads with FP8 <https://towardsdatascience.com/accelerating-pytorch-training-workloads-with-fp8-5a5123aec7d7>`_
+* [09/2023] `Transformer Engine added to AWS DL Container for PyTorch Training <https://github.com/aws/deep-learning-containers/pull/3315>`_
+* [06/2023] `Breaking MLPerf Training Records with NVIDIA H100 GPUs <https://developer.nvidia.com/blog/breaking-mlperf-training-records-with-nvidia-h100-gpus/>`_
 * [04/2023] `Benchmarking Large Language Models on NVIDIA H100 GPUs with CoreWeave (Part 1) <https://www.mosaicml.com/blog/coreweave-nvidia-h100-part-1>`_
 
-
 What is Transformer Engine?
-==================
+===========================
 .. overview-begin-marker-do-not-remove
 
 Transformer Engine (TE) is a library for accelerating Transformer models on NVIDIA GPUs, including
@@ -44,7 +56,7 @@ Modules provided by TE internally maintain scaling factors and other values need
 simplifying mixed precision training for users.
 
 Highlights
-----------
+==========
 
 * Easy-to-use modules for building Transformer layers with FP8 support
 * Optimizations (e.g. fused kernels) for Transformer models
@@ -52,7 +64,7 @@ Highlights
 * Support for optimizations across all precisions (FP16, BF16) on NVIDIA Ampere GPU architecture generations and later
 
 Examples
-----------
+========
 
 PyTorch
 ^^^^^^^
@@ -73,7 +85,7 @@ PyTorch
   inp = torch.randn(hidden_size, in_features, device="cuda")
 
   # Create an FP8 recipe. Note: All input args are optional.
-  fp8_recipe = recipe.DelayedScaling(margin=0, interval=1, fp8_format=recipe.Format.E4M3)
+  fp8_recipe = recipe.DelayedScaling(margin=0, fp8_format=recipe.Format.E4M3)
 
   # Enable autocasting for the forward pass
   with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
@@ -91,6 +103,7 @@ Flax
 
 .. code-block:: python
 
+  import flax
   import jax
   import jax.numpy as jnp
   import transformer_engine.jax as te
@@ -107,7 +120,7 @@ Flax
   inp = jax.random.normal(data_rng, [BATCH, SEQLEN, HIDDEN], jnp.float32)
 
   # Create an FP8 recipe. Note: All input args are optional.
-  fp8_recipe = recipe.DelayedScaling(margin=0, interval=1, fp8_format=recipe.Format.HYBRID)
+  fp8_recipe = recipe.DelayedScaling(margin=0, fp8_format=recipe.Format.HYBRID)
 
   # Enable autocasting for the forward pass
   with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
@@ -119,7 +132,7 @@ Flax
 
       # Initialize models.
       variables = model.init(init_rng, inp)
-      other_variables, params = variables.pop('params')
+      other_variables, params = flax.core.pop(variables, 'params')
 
       # Construct the forward and backward function
       fwd_bwd_fn = jax.value_and_grad(loss_fn, argnums=(0, 1))
@@ -130,14 +143,14 @@ Flax
 .. overview-end-marker-do-not-remove
 
 Installation
-----------
+============
 .. installation
 
 Pre-requisites
 ^^^^^^^^^^^^^^^^^^^^
 * Linux x86_64
-* CUDA 11.8+ for Hopper and CUDA 12.1+ for Ada
-* NVIDIA Driver supporting CUDA 11.8 or later
+* CUDA 12.0+ for Hopper and CUDA 12.1+ for Ada
+* NVIDIA Driver supporting CUDA 12.0 or later
 * cuDNN 8.1 or later
 * For fused attention, CUDA 12.1 or later, NVIDIA Driver supporting CUDA 12.1 or later, and cuDNN 8.9 or later.
 
@@ -161,7 +174,15 @@ To install the latest stable version of Transformer Engine,
 
     pip install git+https://github.com/NVIDIA/TransformerEngine.git@stable
 
-This will automatically detect if any supported deep learning frameworks are installed and build Transformer Engine support for them. To explicitly specify frameworks, set the environment variable NVTE_FRAMEWORK to a comma-separated list (e.g. NVTE_FRAMEWORK=jax,pytorch).
+This will automatically detect if any supported deep learning frameworks are installed and build Transformer Engine support for them. To explicitly specify frameworks, set the environment variable NVTE_FRAMEWORK to a comma-separated list (e.g. NVTE_FRAMEWORK=jax,pytorch,paddle).
+
+Alternatively, the package can be directly installed from `Transformer Engine's PyPI <https://pypi.org/project/transformer-engine/>`_, e.g.
+
+.. code-block:: bash
+
+    pip install transformer_engine[pytorch]
+
+To obtain the necessary Python bindings for Transformer Engine, the frameworks needed must be explicitly specified as extra dependencies in a comma-separated list (e.g. [jax,pytorch,paddle]). Transformer Engine ships wheels for the core library as well as the PaddlePaddle extensions. Source distributions are shipped for the JAX and PyTorch extensions.
 
 From source
 ^^^^^^^^^^^
@@ -169,75 +190,68 @@ From source
 
 Compiling with FlashAttention-2
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Transformer Engine release v0.11.0 adds support for FlashAttention-2 in PyTorch for improved performance. 
+Transformer Engine release v0.11.0 adds support for FlashAttention-2 in PyTorch for improved performance.
 
-It is a known issue that FlashAttention-2 compilation is resource-intensive and requires a large amount of RAM (see `bug <https://github.com/Dao-AILab/flash-attention/issues/358>`_), which may lead to out of memory errors during the installation of Transformer Engine. Please try setting **MAX_JOBS=1** in the environment to circumvent the issue. If the errors persist, install a supported version of FlashAttention-1 (v1.0.6 to v1.0.9).
+It is a known issue that FlashAttention-2 compilation is resource-intensive and requires a large amount of RAM (see `bug <https://github.com/Dao-AILab/flash-attention/issues/358>`_), which may lead to out of memory errors during the installation of Transformer Engine. Please try setting **MAX_JOBS=1** in the environment to circumvent the issue.
 
 Note that NGC PyTorch 23.08+ containers include FlashAttention-2.
 
-Model Support
-----------
+Breaking Changes
+================
 
-While the more granular modules in Transformer Engine allow building any Transformer architecture,
-the `TransformerLayer` API of Transformer Engine is flexible enough to build multiple major
-Transformer model architectures.
+v1.7: Padding mask definition for PyTorch
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+In an effort to unify the definition and usage of the attention mask across all three frameworks in Transformer Engine, the padding mask has changed from `True` meaning inclusion of the corresponding position in attention to exclusion of that position in our PyTorch implementation. Since v1.7, all attention mask types follow the same definition where `True` means masking out the corresponding position and `False` means including that position in attention calculation.
 
-Transformer Engine supports the following DL frameworks: PyTorch and JAX (Flax, Praxis).
+An example of this change is,
 
-NOTE: For simplicity, we only show PyTorch examples below. For the usage of `TransformerLayer`
-of all supported frameworks, refer to `examples <https://github.com/NVIDIA/TransformerEngine/tree/main/examples>`_.
+.. code-block:: bash
 
-GPT
-^^^
+    # for a batch of 3 sequences where `a`s, `b`s and `c`s are the useful tokens
+    # and `0`s are the padding tokens,
+    [a, a, a, 0, 0,
+     b, b, 0, 0, 0,
+     c, c, c, c, 0]
+    # the padding mask for this batch before v1.7 is,
+    [ True,  True,  True, False, False,
+      True,  True, False, False, False,
+      True,  True,  True,  True, False]
+    # and for v1.7 onwards it should be,
+    [False, False, False,  True,  True,
+     False, False,  True,  True,  True,
+     False, False, False, False,  True]
 
-`GPT` architecture has `LayerNorm` at the input side (before `QKV Gemm`) and the residual connection
-is taken from the input of that `LayerNorm`. In TE this can be achieved by setting the following
-arguments in the `TransformerLayer` API.
+FP8 Convergence
+===============
 
-.. code-block:: python
+FP8 has been tested extensively across different model architectures and configurations and we found **no significant difference** between FP8 and BF16 training loss curves. FP8 has also been validated for accuracy on downstream LLM tasks (e.g. LAMBADA and WikiText). Below are examples of models tested for convergence across different frameworks.
 
-  transformer_engine.pytorch.TransformerLayer(
-          ...,
-          ...,
-          apply_residual_connection_post_layernorm=False,
-          output_layernorm=False,
-          layer_type="encoder",
-  )
-
-BERT
-^^^^
-
-`BERT` architecture has `LayerNorm` at the output side (after the final `BiasDropoutAdd`) and the
-residual connection is taken from the output of that `LayerNorm`. In TE this can be achieved by
-setting the following arguments in the `TransformerLayer` API.
-
-.. code-block:: python
-
-  transformer_engine.pytorch.TransformerLayer(
-          ...,
-          ...,
-          apply_residual_connection_post_layernorm=True,
-          output_layernorm=True,
-          layer_type="encoder",
-  )
-
-T5
-^^
-
-`T5` architecture has an additional `cross-attention` + `BiasDropoutAdd` + `LayerNorm` block before
-the `MLP` layer. In TE this can be added by setting the `layer_type` to `decoder` in the
-`TransformerLayer` API.
-
-.. code-block:: python
-
-  transformer_engine.pytorch.TransformerLayer(
-          ...,
-          ...,
-          layer_type="decoder",
-  )
++------------+------------------+---------------------------------------------------------------------------------------------------------+
+| Model      | Framework        | Source                                                                                                  |
++============+==================+=========================================================================================================+
+| T5-770M    |  JAX/T5x         | https://github.com/NVIDIA/JAX-Toolbox/tree/main/rosetta/rosetta/projects/t5x#convergence-and-performance|
++------------+------------------+---------------------------------------------------------------------------------------------------------+
+| MPT-1.3B   |  Mosaic Composer | https://www.mosaicml.com/blog/coreweave-nvidia-h100-part-1                                              |
++------------+------------------+---------------------------------------------------------------------------------------------------------+
+| GPT-5B     |  JAX/Paxml       | https://github.com/NVIDIA/JAX-Toolbox/tree/main/rosetta/rosetta/projects/pax#h100-results               |
++------------+------------------+---------------------------------------------------------------------------------------------------------+
+| GPT-5B     |  NeMo Framework  | Available on request                                                                                    |
++------------+------------------+---------------------------------------------------------------------------------------------------------+
+| LLama2-7B  |  Alibaba Pai     | https://mp.weixin.qq.com/s/NQT0uKXLbXyh5031zBdeBQ                                                       |
++------------+------------------+---------------------------------------------------------------------------------------------------------+
+| T5-11B     |  JAX/T5x         | Available on request                                                                                    |
++------------+------------------+---------------------------------------------------------------------------------------------------------+
+| MPT-13B    |  Mosaic Composer | https://www.databricks.com/blog/turbocharged-training-optimizing-databricks-mosaic-ai-stack-fp8         |
++------------+------------------+---------------------------------------------------------------------------------------------------------+
+| GPT-22B    |  NeMo Framework  | Available on request                                                                                    |
++------------+------------------+---------------------------------------------------------------------------------------------------------+
+| LLama2-70B |  Alibaba Pai     | https://mp.weixin.qq.com/s/NQT0uKXLbXyh5031zBdeBQ                                                       |
++------------+------------------+---------------------------------------------------------------------------------------------------------+
+| GPT-175B   |  JAX/Paxml       | https://github.com/NVIDIA/JAX-Toolbox/tree/main/rosetta/rosetta/projects/pax#h100-results               |
++------------+------------------+---------------------------------------------------------------------------------------------------------+
 
 Integrations
-==================
+============
 
 Transformer Engine has been integrated with popular LLM frameworks such as:
 
@@ -247,20 +261,23 @@ Transformer Engine has been integrated with popular LLM frameworks such as:
 * `MosaicML Composer <https://github.com/mosaicml/composer/releases/tag/v0.13.1>`_
 * `NVIDIA JAX Toolbox <https://github.com/NVIDIA/JAX-Toolbox>`_
 * `NVIDIA Megatron-LM <https://github.com/NVIDIA/Megatron-LM>`_
-* `NVIDIA NeMo <https://github.com/NVIDIA/NeMo>`_
-* `Amazon SageMaker Model Parallel Library <https://docs.aws.amazon.com/sagemaker/latest/dg/model-parallel.html>`_ - Coming soon!
+* `NVIDIA NeMo Framework <https://github.com/NVIDIA/NeMo-Megatron-Launcher>`_
+* `Amazon SageMaker Model Parallel Library <https://docs.aws.amazon.com/sagemaker/latest/dg/model-parallel-core-features-v2-tensor-parallelism.html>`_
+* `Levanter <https://github.com/stanford-crfm/levanter>`_
+* `Hugging Face Nanotron <https://github.com/huggingface/nanotron>`_ - Coming soon!
 * `Colossal-AI <https://github.com/hpcaitech/ColossalAI>`_ - Coming soon!
 * `PeriFlow <https://github.com/friendliai/periflow-python-sdk>`_ - Coming soon!
+* `GPT-NeoX <https://github.com/EleutherAI/gpt-neox>`_ - Coming soon!
 
 
 Contributing
-==================
+============
 
 We welcome contributions to Transformer Engine! To contribute to Transformer Engine and make pull requests,
 follow the guidelines outlined in the `<CONTRIBUTING.rst>`_ guide.
 
 Papers
-==================
+======
 
 * `Attention original paper <https://proceedings.neurips.cc/paper/2017/file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf>`_
 * `Megatron-LM tensor parallel <https://arxiv.org/pdf/1909.08053.pdf>`_
@@ -268,10 +285,11 @@ Papers
 * `FP8 Formats for Deep Learning <https://arxiv.org/abs/2209.05433>`_
 
 Videos
-==================
+======
 
-* `FP8 Training with Transformer Engine <https://www.nvidia.com/en-us/on-demand/session/gtcspring23-s51393>`_
-* `FP8 for Deep Learning <https://www.nvidia.com/en-us/on-demand/session/gtcspring23-s52166/>`_
+* `What's New in Transformer Engine and FP8 Training | GTC 2024 <https://www.nvidia.com/en-us/on-demand/session/gtc24-s62457/>`_
+* `FP8 Training with Transformer Engine | GTC 2023 <https://www.nvidia.com/en-us/on-demand/session/gtcspring23-s51393>`_
+* `FP8 for Deep Learning | GTC 2023 <https://www.nvidia.com/en-us/on-demand/session/gtcspring23-s52166/>`_
 * `Inside the Hopper Architecture <https://www.nvidia.com/en-us/on-demand/session/gtcspring22-s42663/>`_
 
 .. |License| image:: https://img.shields.io/badge/License-Apache%202.0-blue.svg

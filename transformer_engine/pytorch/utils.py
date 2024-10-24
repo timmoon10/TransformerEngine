@@ -1,23 +1,41 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
 """Utility functions for Transformer Engine modules"""
+from __future__ import annotations
+import functools
 import math
 from typing import Any, Callable, Optional, Tuple
+
 import torch
+import transformer_engine.pytorch.cpp_extensions as ext
 
 
-def clear_tensor_data(*tensors: Tuple[torch.Tensor, ...]) -> None:
+def requires_grad(*tensors: Tuple[Optional[torch.Tensor], ...]) -> None:
+    """Check if any of the given tensors require gradient."""
+    for tensor in tensors:
+        if tensor is not None and tensor.requires_grad:
+            return True
+    return False
+
+
+def clear_tensor_data(*tensors: Tuple[Optional[torch.Tensor], ...]) -> None:
     """
     Trick to deallocate tensor memory when delete operation does not
     release the tensor due to PyTorch override.
 
     Must be used carefully.
     """
+    from .float8_tensor import Float8Tensor
+
     for t in tensors:
-        t.data = torch.Tensor()
-        del t
+        if t is not None:
+            if isinstance(t, Float8Tensor):
+                t._data.data = torch.Tensor()
+            else:
+                t.data = torch.Tensor()
+            del t
 
 
 def get_device_compute_capability() -> Tuple[int, int]:
@@ -37,6 +55,26 @@ def attention_mask_func(
 def get_default_init_method() -> Callable:
     """Weight initialization method if not provided by user"""
     return init_method_normal(0.023)
+
+
+def init_method_constant(val: float) -> Callable:
+    """Init method to set all tensor elements to a constant value."""
+    if val == 1.0:
+
+        def init_(tensor: torch.Tensor) -> Callable:
+            return torch.nn.init.ones_(tensor)
+
+    elif val == 0.0:
+
+        def init_(tensor: torch.Tensor) -> Callable:
+            return torch.nn.init.zeros_(tensor)
+
+    else:
+
+        def init_(tensor: torch.Tensor) -> Callable:
+            return torch.nn.init.constant_(tensor, val)
+
+    return init_
 
 
 def init_method_normal(sigma: float) -> Callable:
@@ -84,9 +122,7 @@ def compare_tensors(a: torch.Tensor, b: torch.Tensor) -> None:
 
 def ensure_divisibility(numerator: int, denominator: int) -> None:
     """Ensure that numerator is divisible by the denominator."""
-    assert (
-        numerator % denominator == 0
-    ), f"{numerator} is not divisible by {denominator}"
+    assert numerator % denominator == 0, f"{numerator} is not divisible by {denominator}"
 
 
 def divide(numerator: int, denominator: int) -> int:
@@ -150,9 +186,7 @@ def validate_rng_states_func(get_rng_tracker: Callable) -> None:
     validate_ctx_manager(rng_tracker.fork)
 
 
-def assert_viewless_tensor(
-    tensor: torch.Tensor, extra_msg: Optional[str] = None
-) -> torch.Tensor:
+def assert_viewless_tensor(tensor: torch.Tensor, extra_msg: Optional[str] = None) -> torch.Tensor:
     """Assert that a tensor is not a view (i.e., its '._base' field is
     not set)."""
     if isinstance(tensor, list):
@@ -160,23 +194,21 @@ def assert_viewless_tensor(
     if not isinstance(tensor, torch.Tensor):
         return tensor
     assert tensor._base is None, (
-        f"Ensure tensor._base is None before setting tensor.data or storing "
-        f"tensor to memory buffer. Otherwise, a memory leak will occur (and "
+        "Ensure tensor._base is None before setting tensor.data or storing "
+        "tensor to memory buffer. Otherwise, a memory leak will occur (and "
         f"likely accumulate over iterations). {extra_msg}"
     )
     return tensor
 
 
-def safely_set_viewless_tensor_data(
-    tensor: torch.Tensor, new_data_tensor: torch.Tensor
-) -> None:
+def safely_set_viewless_tensor_data(tensor: torch.Tensor, new_data_tensor: torch.Tensor) -> None:
     """Safely set tensor's '.data' field.
 
     Check first that the tensor is viewless (i.e., '._base' not set). If not,
     raise an exception.
     """
     extra_msg = (
-        f"FYI, tensor._base has shape "
+        "FYI, tensor._base has shape "
         f"{'--' if tensor._base is None else tensor._base.shape},"
         f"and new_data_tensor has shape {new_data_tensor.shape}."
     )
@@ -186,23 +218,90 @@ def safely_set_viewless_tensor_data(
 
 def cast_if_needed(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Cast tensor to dtype"""
+    if tensor is None:
+        return None
+    if tensor.dtype == dtype:
+        return tensor
     with torch.enable_grad():
-        return tensor if tensor is None or tensor.dtype == dtype else tensor.to(dtype)
+        return tensor.to(dtype=dtype)
 
 
 def check_dim_for_fp8_exec(tensor: torch.Tensor) -> bool:
-    """For fp8 fprop (TN layout), inputs and weights must be such
-       that dim0 is divisible by 8 and dim1 is divisible by 16.
-    """
-    return not tensor.shape[0] % 8 and not tensor.shape[1] % 16
+    """Check if tensor dimensions are supported for FP8 TN GEMM"""
+    return tensor.dim() == 2 and tensor.size(0) % 8 == 0 and tensor.size(1) % 16 == 0
 
 
 def assert_dim_for_fp8_exec(tensor: torch.Tensor) -> None:
-    """For fp8 fprop (TN layout), inputs and weights must be such
-       that dim0 is divisible by 8 and dim1 is divisible by 16.
-    """
+    """Assert that tensor dimensions are supported for FP8 TN GEMM"""
     # single tensor check so it's clear which tensor is triggering the assertion
-    assert check_dim_for_fp8_exec(tensor), (
-        "Tensor dimensions are not compatible for FP8 execution: "
-        f"({tensor.shape[0]} % 8 != 0, {tensor.shape[1]} % 16 != 0)"
+    assert tensor.dim() == 2 and tensor.size(0) % 8 == 0 and tensor.size(1) % 16 == 0, (
+        "FP8 execution requires 2D input matrices with "
+        "height divisible by 8 and width divisible by 16, "
+        f"but got tensor with dims={list(tensor.size())}"
     )
+
+
+def is_bf16_compatible() -> None:
+    """Replaces torch.cuda.is_bf16_compatible() with an explicit
+    check on device compute capability to enforce sm_80 or higher.
+    """
+    return torch.cuda.get_device_capability()[0] >= 8
+
+
+@functools.lru_cache(maxsize=None)
+def get_cudnn_version() -> Tuple[int, int, int]:
+    """Runtime cuDNN version (major, minor, patch)"""
+    encoded_version = ext.get_cudnn_version()
+    major_version_magnitude = 1000 if encoded_version < 90000 else 10000
+    major, encoded_version = divmod(encoded_version, major_version_magnitude)
+    minor, patch = divmod(encoded_version, 100)
+    return (major, minor, patch)
+
+
+def canonicalize_device(device: Optional[torch.device | str]) -> torch.device:
+    """Canonicalize PyTorch device
+
+    If `None`, then returns the default CUDA device.
+
+    """
+    if device is None:
+        # Use default CUDA device
+        device = torch.get_default_device()
+        if device.type != "cuda":
+            device = torch.device("cuda", torch.cuda.current_device())
+    elif not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
+def canonicalize_dtype(dtype: Optional[torch.dtype]) -> torch.dtype:
+    """Canonicalize PyTorch datatype
+
+    If `None`, then returns the default PyTorch datatype.
+
+    """
+    if dtype is None:
+        # Use default dtype
+        dtype = torch.get_default_dtype()
+    return dtype
+
+
+def devices_match(device1: torch.device, device2: torch.device) -> bool:
+    """Whether two devices are the same"""
+    device1 = torch.device(device1)
+    device2 = torch.device(device2)
+    if device1.type != device2.type:
+        return False
+    if device1.type == "cuda":
+        index1 = device1.index
+        index2 = device2.index
+        if index1 == index2:
+            return True
+        if index1 is None:
+            index1 = torch.cuda.current_device()
+        if index2 is None:
+            index2 = torch.cuda.current_device()
+        return index1 == index2
+    return device1 == device2

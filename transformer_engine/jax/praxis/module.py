@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 """
@@ -19,7 +19,6 @@ from ..flax.module import LayerNorm as flax_LayerNorm
 from ..flax.module import LayerNormMLP as flax_LayerNormMLP
 from ..flax.module import Softmax
 from ..softmax import SoftmaxType
-from ..sharding import MajorShardingType, ShardingType
 
 
 def _generate_ln_scale_init(scale_init):
@@ -50,17 +49,19 @@ class TransformerEngineBaseLayer(BaseLayer):
             FP8Helper.FP8_COLLECTION_NAME: [
                 WeightHParamsCollection.SKIP_LP_REGULARIZATION,
                 WeightHParamsCollection.OVERWRITE_WITH_GRADIENT,
-                WeightHParamsCollection.DISALLOW_BFLOAT16_CONVERSION
+                WeightHParamsCollection.DISALLOW_BFLOAT16_CONVERSION,
             ]
         }
 
-        flax_module_p = pax_fiddle.Config(flax_adapter.FlaxModuleAdapter,
-                                          module_factory_method=flax_module_cls,
-                                          logical_axes_rules=self.logical_axes_rules,
-                                          var_collection_map=fp8_collection_map,
-                                          ici_mesh_shape=self.ici_mesh_shape,
-                                          dcn_mesh_shape=self.dcn_mesh_shape,
-                                          mesh_axis_names=self.mesh_axis_names)
+        flax_module_p = pax_fiddle.Config(
+            flax_adapter.FlaxModuleAdapter,
+            module_factory_method=flax_module_cls,
+            logical_axes_rules=self.logical_axes_rules,
+            var_collection_map=fp8_collection_map,
+            ici_mesh_shape=self.ici_mesh_shape,
+            dcn_mesh_shape=self.dcn_mesh_shape,
+            mesh_axis_names=self.mesh_axis_names,
+        )
 
         self.create_child(name, flax_module_p.clone())
 
@@ -69,30 +70,30 @@ class LayerNorm(TransformerEngineBaseLayer):
     """LayerNorm"""
 
     epsilon: float = 1e-6
-    layernorm_type: str = 'layernorm'
+    layernorm_type: str = "layernorm"
     zero_centered_gamma: bool = False
     scale_init: WeightInit = None
     scale_axes: Tuple[str, ...] = ()
     bias_init: WeightInit = WeightInit.Constant(0.0)
     bias_axes: Tuple[str, ...] = ()
     transpose_batch_sequence: bool = False
-    sharding_type: ShardingType = ShardingType.SINGLE
 
     def setup(self) -> None:
         """setup"""
         super().setup()
 
-        ln_cls = partial(flax_LayerNorm,
-                         epsilon=self.epsilon,
-                         layernorm_type=self.layernorm_type,
-                         zero_centered_gamma=self.zero_centered_gamma,
-                         scale_init=_generate_ln_scale_init(self.scale_init),
-                         scale_axes=self.scale_axes,
-                         bias_init=TransformerEngineBaseLayer.generate_params_init(
-                             "ln_bias", self.bias_init),
-                         bias_axes=self.bias_axes,
-                         dtype=self.dtype,
-                         transpose_batch_sequence=self.transpose_batch_sequence)
+        ln_cls = partial(
+            flax_LayerNorm,
+            epsilon=self.epsilon,
+            layernorm_type=self.layernorm_type,
+            zero_centered_gamma=self.zero_centered_gamma,
+            scale_init=_generate_ln_scale_init(self.scale_init),
+            scale_axes=self.scale_axes,
+            bias_init=TransformerEngineBaseLayer.generate_params_init("ln_bias", self.bias_init),
+            bias_axes=self.bias_axes,
+            dtype=self.dtype,
+            transpose_batch_sequence=self.transpose_batch_sequence,
+        )
 
         self.create_layer("layer_norm", ln_cls)
 
@@ -106,15 +107,14 @@ class FusedSoftmax(TransformerEngineBaseLayer):
 
     scale_factor: float = 1.0
     softmax_type: SoftmaxType = SoftmaxType.SCALED
-    sharding_type: ShardingType = ShardingType.SINGLE
 
     def setup(self) -> None:
         """setup"""
         super().setup()
 
-        fused_softmax_cls = partial(Softmax,
-                                    scale_factor=self.scale_factor,
-                                    softmax_type=self.softmax_type)
+        fused_softmax_cls = partial(
+            Softmax, scale_factor=self.scale_factor, softmax_type=self.softmax_type
+        )
 
         self.create_layer("fused_softmax", fused_softmax_cls)
 
@@ -131,9 +131,11 @@ class Linear(TransformerEngineBaseLayer):
     use_bias: bool = True
     bias_init: WeightInit = WeightInit.Constant(0.0)
     bias_axes: Tuple[str, ...] = ()
+    enable_low_rank_adaptation: bool = False
+    low_rank_adaptation_dim: int = 32
+    low_rank_adaptation_alpha: float = None
     axis: Union[Iterable[int], int] = -1
     transpose_batch_sequence: bool = False
-    sharding_type: ShardingType = ShardingType.SINGLE
 
     def setup(self) -> None:
         """setup"""
@@ -147,9 +149,13 @@ class Linear(TransformerEngineBaseLayer):
             use_bias=self.use_bias,
             bias_init=TransformerEngineBaseLayer.generate_params_init("bias", self.bias_init),
             bias_axes=self.bias_axes,
+            enable_low_rank_adaptation=self.enable_low_rank_adaptation,
+            low_rank_adaptation_dim=self.low_rank_adaptation_dim,
+            low_rank_adaptation_alpha=self.low_rank_adaptation_alpha,
             axis=self.axis,
             dtype=self.dtype,
-            transpose_batch_sequence=self.transpose_batch_sequence)
+            transpose_batch_sequence=self.transpose_batch_sequence,
+        )
 
         self.create_layer("linear", dense_general_cls)
 
@@ -163,7 +169,7 @@ class LayerNormLinear(TransformerEngineBaseLayer):
 
     out_features: int = 512
     enable_layernorm: bool = True
-    layernorm_type: str = 'layernorm'
+    layernorm_type: str = "layernorm"
     epsilon: float = 1e-6
     zero_centered_gamma: bool = False
     scale_init: WeightInit = None
@@ -174,11 +180,13 @@ class LayerNormLinear(TransformerEngineBaseLayer):
     use_bias: bool = False
     bias_init: WeightInit = WeightInit.Constant(0.0)
     bias_axes: Tuple[str, ...] = ()
+    enable_low_rank_adaptation: bool = False
+    low_rank_adaptation_dim: int = 32
+    low_rank_adaptation_alpha: float = None
     return_layernorm_output: bool = True
     axis: Union[Iterable[int], int] = -1
     transpose_batch_sequence: bool = False
     depth_scaling: float = None
-    sharding_type: ShardingType = ShardingType.SINGLE
 
     def setup(self) -> None:
         """setup"""
@@ -194,18 +202,23 @@ class LayerNormLinear(TransformerEngineBaseLayer):
             scale_init=_generate_ln_scale_init(self.scale_init),
             scale_axes=self.scale_axes,
             ln_bias_init=TransformerEngineBaseLayer.generate_params_init(
-                "ln_bias", self.ln_bias_init),
+                "ln_bias", self.ln_bias_init
+            ),
             ln_bias_axes=self.ln_bias_axes,
             kernel_init=TransformerEngineBaseLayer.generate_params_init("kernel", self.params_init),
             kernel_axes=self.kernel_axes,
             use_bias=self.use_bias,
             bias_init=TransformerEngineBaseLayer.generate_params_init("bias", self.bias_init),
             bias_axes=self.bias_axes,
+            enable_low_rank_adaptation=self.enable_low_rank_adaptation,
+            low_rank_adaptation_dim=self.low_rank_adaptation_dim,
+            low_rank_adaptation_alpha=self.low_rank_adaptation_alpha,
             return_layernorm_output=self.return_layernorm_output,
             axis=self.axis,
             dtype=self.dtype,
             transpose_batch_sequence=self.transpose_batch_sequence,
-            depth_scaling=self.depth_scaling)
+            depth_scaling=self.depth_scaling,
+        )
 
         self.create_layer("ln_linear", ln_dense_general_cls)
 
@@ -219,7 +232,7 @@ class LayerNormMLP(TransformerEngineBaseLayer):
 
     intermediate_dim: int = 2048
     enable_layernorm: bool = True
-    layernorm_type: str = 'layernorm'
+    layernorm_type: str = "layernorm"
     epsilon: float = 1e-6
     zero_centered_gamma: bool = False
     scale_init: WeightInit = None
@@ -232,13 +245,15 @@ class LayerNormMLP(TransformerEngineBaseLayer):
     bias_init: WeightInit = WeightInit.Constant(0.0)
     bias_axes_1: Tuple[str, ...] = ()
     bias_axes_2: Tuple[str, ...] = ()
+    enable_low_rank_adaptation: bool = False
+    low_rank_adaptation_dim: int = 32
+    low_rank_adaptation_alpha: float = None
     return_layernorm_output: bool = True
-    activations: Sequence[Union[str, Callable]] = ('relu',)
+    activations: Sequence[Union[str, Callable]] = ("relu",)
     intermediate_dropout_rate: float = 0.1
     intermediate_hidden_dropout_dims: Sequence[int] = ()
     axis: Union[Iterable[int], int] = -1
     transpose_batch_sequence: bool = False
-    major_sharding_type: MajorShardingType = MajorShardingType.SINGLE
 
     def setup(self) -> None:
         """setup"""
@@ -254,7 +269,8 @@ class LayerNormMLP(TransformerEngineBaseLayer):
             scale_init=_generate_ln_scale_init(self.scale_init),
             scale_axes=self.scale_axes,
             ln_bias_init=TransformerEngineBaseLayer.generate_params_init(
-                "ln_bias", self.ln_bias_init),
+                "ln_bias", self.ln_bias_init
+            ),
             ln_bias_axes=self.ln_bias_axes,
             kernel_init=TransformerEngineBaseLayer.generate_params_init("kernel", self.params_init),
             kernel_axes_1=self.kernel_axes_1,
@@ -263,13 +279,17 @@ class LayerNormMLP(TransformerEngineBaseLayer):
             bias_init=TransformerEngineBaseLayer.generate_params_init("bias", self.bias_init),
             bias_axes_1=self.bias_axes_1,
             bias_axes_2=self.bias_axes_2,
+            enable_low_rank_adaptation=self.enable_low_rank_adaptation,
+            low_rank_adaptation_dim=self.low_rank_adaptation_dim,
+            low_rank_adaptation_alpha=self.low_rank_adaptation_alpha,
             return_layernorm_output=self.return_layernorm_output,
             activations=self.activations,
             intermediate_dropout_rate=self.intermediate_dropout_rate,
             intermediate_hidden_dropout_dims=self.intermediate_hidden_dropout_dims,
             axis=self.axis,
             dtype=self.dtype,
-            transpose_batch_sequence=self.transpose_batch_sequence)
+            transpose_batch_sequence=self.transpose_batch_sequence,
+        )
 
         self.create_layer("ln_mlp", ln_mlp_cls)
 

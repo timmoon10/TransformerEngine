@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * See LICENSE for license information.
  ************************************************************************/
@@ -138,6 +138,10 @@ void performTest() {
       compareResults("amax",
                      output_c_list[tensor_id].amax(),
                      ref_amax_list[tensor_id],
+                     atol_amax, rtol_amax);
+      compareResults("scale_inv",
+                     output_c_list[tensor_id].scale_inv(),
+                     1.f / output_c_list[tensor_id].scale(),
                      atol_amax, rtol_amax);
     }
     auto [atol, rtol] = getTolerances(otype);

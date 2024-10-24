@@ -1,9 +1,11 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 import operator
 import re
 from functools import reduce
+from itertools import product
+import pytest
 
 import jax
 from jax.experimental.pjit import pjit, _UNSPECIFIED
@@ -16,15 +18,37 @@ from utils import assert_allclose, is_devices_enough
 def generate_configs():
     configs = []
     if is_devices_enough(2):
-        configs.append([2, (2,), ('dp'), MeshResource(dp_resource='dp')])
-        configs.append([2, (2,), ('tp'), MeshResource(tp_resource='tp')])
+        configs.append([2, (2,), "dp", MeshResource(dp_resource="dp")])
+        configs.append([2, (2,), "tp", MeshResource(tp_resource="tp")])
 
     if is_devices_enough(4):
         TP_size = 2
         DP_size = 2
         configs.append(
-            [4, (DP_size, TP_size), ('dp', 'tp'),
-             MeshResource(dp_resource='dp', tp_resource='tp')])
+            [4, (DP_size, TP_size), ("dp", "tp"), MeshResource(dp_resource="dp", tp_resource="tp")]
+        )
+
+    return configs
+
+
+def generate_context_parallel_configs():
+    configs = []
+
+    DP_sizes = (1, 2)
+    CP_sizes = (1, 2, 4, 8)
+    TP_sizes = (1, 2)
+    for dp, cp, tp in product(DP_sizes, CP_sizes, TP_sizes):
+        ndev = cp * tp * dp
+        if is_devices_enough(ndev):
+            configs.append(
+                pytest.param(
+                    ndev,
+                    (dp, cp, tp),
+                    ("dp", "cp", "tp"),
+                    MeshResource(dp_resource="dp", cp_resource="cp", tp_resource="tp"),
+                    id=f"n{ndev}_dp{dp}_cp{cp}_tp{tp}",
+                )
+            )
 
     return configs
 
@@ -46,7 +70,7 @@ def assert_equal_collectives(target_hlo, coll_count_ref):
         bytes_count = 0
 
         def get_bytes_per_txt(t):
-            '''
+            """
             The pattern of t would be like:
                 'f32[]',
                 '(f32[1024]{0}',
@@ -54,24 +78,24 @@ def assert_equal_collectives(target_hlo, coll_count_ref):
                 'f8E4M3FN[1024]{0}',
                 'i32[1024]{0}',
                 'bf16[1024,1024]{0}'
-            '''
-            match = re.search(r'(i|f)(\d+).*\[([0-9,]*)\]', t)
+            """
+            match = re.search(r"(i|f)(\d+).*\[([0-9,]*)\]", t)
             _, bits_of_type, shape = match.groups()
             bytes_of_type = int(bits_of_type) // 8
-            if shape == '':
+            if shape == "":
                 num_of_elements = 1
             else:
-                num_of_elements = reduce(operator.mul, map(int, shape.split(',')))
+                num_of_elements = reduce(operator.mul, map(int, shape.split(",")))
 
             return bytes_of_type * num_of_elements
 
         # ['xxx-start', '=', '(bf16[xxx]', 'bf16[xxx])', 'xxx-start(', ...]
-        if '(' in hlo_text[2]:
+        if "(" in hlo_text[2]:
             for txt in hlo_text[2:]:
                 bytes_count += get_bytes_per_txt(txt)
-                if ')' in txt:
+                if ")" in txt:
                     break
-        else:    # ['xxx-start', '=', 'fp32[]', 'xxx-start(', ...]
+        else:  # ['xxx-start', '=', 'fp32[]', 'xxx-start(', ...]
             bytes_count = get_bytes_per_txt(hlo_text[2])
 
         return bytes_count
@@ -91,21 +115,24 @@ def assert_equal_collectives(target_hlo, coll_count_ref):
         return result
 
     target_result = count_collectives(target_splitted_hlo)
-    assert target_result == coll_count_ref, \
-        f"Expected collective count is {coll_count_ref}, but got {target_result}."
+    assert (
+        target_result == coll_count_ref
+    ), f"Expected collective count is {coll_count_ref}, but got {target_result}."
 
 
-def compare_ops(target_func,
-                ref_func,
-                inputs,
-                coll_count_ref,
-                *,
-                grad_args=None,
-                metric_fwd_dtype=None,
-                metric_bwd_dtype=None,
-                in_shardings=_UNSPECIFIED,
-                out_shardings=_UNSPECIFIED,
-                **kwargs):
+def compare_ops(
+    target_func,
+    ref_func,
+    inputs,
+    coll_count_ref,
+    *,
+    grad_args=None,
+    metric_fwd_dtype=None,
+    metric_bwd_dtype=None,
+    in_shardings=_UNSPECIFIED,
+    out_shardings=_UNSPECIFIED,
+    **kwargs,
+):
     assert len(inputs) >= 1
 
     if metric_fwd_dtype is None:

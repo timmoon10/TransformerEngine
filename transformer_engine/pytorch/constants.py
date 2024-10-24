@@ -1,11 +1,11 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
 """Enums for e2e transformer"""
 import torch
 import torch.distributed
-import transformer_engine_extensions as tex
+import transformer_engine_torch as tex
 
 
 """
@@ -22,16 +22,37 @@ TE_DType = {
     torch.bfloat16: tex.DType.kBFloat16,
 }
 
-AttnMaskTypes = ("causal", "padding", "arbitrary", "no_mask")
+AttnMaskTypes = (
+    "no_mask",
+    "padding",
+    "causal",
+    "padding_causal",
+    "causal_bottom_right",
+    "padding_causal_bottom_right",
+    "arbitrary",
+)
 
 AttnTypes = ("self", "cross")
 
-AttnBiasTypes = ("pre_scale_bias", "post_scale_bias", "no_bias")
+AttnBiasTypes = ("pre_scale_bias", "post_scale_bias", "no_bias", "alibi")
 
 QKVLayouts = (
-    "sb3hd", "sbh3d", "sbhd_sb2hd", "sbhd_sbh2d", "sbhd_sbhd_sbhd",
-    "bs3hd", "bsh3d", "bshd_bs2hd", "bshd_bsh2d", "bshd_bshd_bshd",
-    "t3hd", "th3d", "thd_t2hd", "thd_th2d", "thd_thd_thd")
+    "sb3hd",
+    "sbh3d",
+    "sbhd_sb2hd",
+    "sbhd_sbh2d",
+    "sbhd_sbhd_sbhd",
+    "bs3hd",
+    "bsh3d",
+    "bshd_bs2hd",
+    "bshd_bsh2d",
+    "bshd_bshd_bshd",
+    "t3hd",
+    "th3d",
+    "thd_t2hd",
+    "thd_th2d",
+    "thd_thd_thd",
+)
 
 LayerTypes = ("encoder", "decoder")
 
