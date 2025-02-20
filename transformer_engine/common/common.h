@@ -7,21 +7,24 @@
 #ifndef TRANSFORMER_ENGINE_COMMON_COMMON_H_
 #define TRANSFORMER_ENGINE_COMMON_COMMON_H_
 
-#include <cudaTypedefs.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime_api.h>
-#include <transformer_engine/transformer_engine.h>
-
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
+#include <variant>
 #include <vector>
 
+#include <cudaTypedefs.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime_api.h>
+
+#include <transformer_engine/transformer_engine.h>
 #include "./nvtx.h"
 #include "./util/cuda_driver.h"
 #include "./util/logging.h"
@@ -51,75 +54,188 @@ struct SimpleTensor {
   std::vector<size_t> shape;
   DType dtype;
 
-  SimpleTensor(void *dptr, const std::vector<size_t> &shape, DType dtype)
-      : dptr(dptr), shape(shape), dtype(dtype) {}
+  SimpleTensor(void *dptr, std::vector<size_t> shape, DType dtype)
+      : dptr{dptr}, shape{std::move(shape)}, dtype{dtype} {}
 
-  SimpleTensor(const NVTEBasicTensor &tensor)  // NOLINT
-      : dptr(tensor.data_ptr),
-        shape(tensor.shape.data, tensor.shape.data + tensor.shape.ndim),
-        dtype(static_cast<DType>(tensor.dtype)) {}
+  SimpleTensor(const NVTEBasicTensor &tensor)
+      : SimpleTensor(tensor.data_ptr,
+                     std::vector<size_t>(tensor.shape.data, tensor.shape.data + tensor.shape.ndim),
+                     static_cast<DType>(tensor.dtype)) {}
 
-  SimpleTensor() : SimpleTensor(nullptr, {}, DType::kFloat32) {}
+  SimpleTensor() : SimpleTensor(nullptr, {static_cast<size_t>(0)}, DType::kFloat32) {}
 
   operator NVTEBasicTensor() const {
     const NVTEShape shape = {this->shape.data(), this->shape.size()};
     return {dptr, static_cast<NVTEDType>(dtype), shape};
   }
 
-  int numel() const {
-    size_t acc = 1;
-    for (const auto &dim : shape) {
-      acc *= dim;
-    }
-    return acc;
+  size_t numel() const {
+    return product(shape);
   }
 };
 
 struct Tensor {
-  SimpleTensor data;
-  SimpleTensor columnwise_data;
-  SimpleTensor amax;
-  SimpleTensor scale;
-  SimpleTensor scale_inv;
-  SimpleTensor columnwise_scale_inv;
 
-  NVTEScalingMode scaling_mode;
+  struct SimpleData {
+    SimpleTensor data;
+  };
 
-  Tensor()
-      : data(),
-        columnwise_data(),
-        amax(nullptr, {1}, DType::kFloat32),
-        scale(nullptr, {1}, DType::kFloat32),
-        scale_inv(nullptr, {1}, DType::kFloat32),
-        columnwise_scale_inv(nullptr, {1}, DType::kFloat32),
-        scaling_mode(NVTE_DELAYED_TENSOR_SCALING) {}
+  struct FP8Data {
+    std::optional<SimpleTensor> data;
+    std::optional<SimpleTensor> transpose_data;
+    SimpleTensor scale_inv;
+    std::optional<SimpleTensor> scale;
+    std::optional<SimpleTensor> amax;
+  };
 
-  int numel() const {
-    NVTE_CHECK(data.dptr != nullptr || columnwise_data.dptr != nullptr,
-               "Tensor does not hold any data!");
-    size_t acc = 1;
-    if (data.dptr != nullptr) {
-      for (const auto &dim : data.shape) {
-        acc *= dim;
+  struct MXFP8Data {
+    std::optional<std::tuple<SimpleTensor, SimpleTensor>> row_scaled_data;
+    std::optional<std::tuple<SimpleTensor, SimpleTensor>> column_scaled_data;
+  };
+
+  std::variant<SimpleData, FP8Data, MXFP8Data> data;
+
+  Tensor() : data{} {}
+
+  std::vector<size_t> shape() const {
+    auto visitor = [] (const auto& data) -> std::vector<size_t> {
+      using DataType = std::decay_t<decltype(data)>;
+      if constexpr (std::is_same_v<DataType, SimpleData>) {
+        return data.data.shape;
       }
-      return acc;
-    }
-    // data is empty, use columnwise_data
-    for (const auto &dim : columnwise_data.shape) {
-      acc *= dim;
-    }
-    return acc;
+      if constexpr (std::is_same_v<DataType, FP8Data>) {
+        if (data.data) {
+          return data.data->shape;
+        } else if (data.transpose_data) {
+          const auto& transpose_shape = data.transpose_data->shape;
+          std::vector<size_t> ret;
+          if (!transpose_shape.empty()) {
+            for (size_t i=1; i<transpose_shape.size(); i++) {
+              ret.push_back(transpose_shape[i]);
+            }
+            ret.push_back(transpose_shape[0]);
+          }
+          return ret;
+        } else {
+          NVTE_ERROR("Could not determine shape because "
+                     "FP8 tensor is missing both data and transpose data");
+        }
+      }
+      if constexpr (std::is_same_v<DataType, FP8Data>) {
+        if (data.row_scaled_data) {
+          return std::get<0>(*data.row_scaled_data).shape;
+        } else if (data.column_scaled_data) {
+          return std::get<0>(*data.column_scaled_data).shape;
+        } else {
+          NVTE_ERROR("Could not determine shape because "
+                     "MXFP8 tensor is missing both row-scaled data and column-scaled data");
+        }
+      }
+      NVTE_ERROR("Could not determine shape because tensor format is not supported");
+      return {};  // dummy
+    };
+    return std::visit(visitor, data);
   }
 
-  bool has_data() const noexcept { return data.dptr != nullptr; }
+  size_t numel() const {
+    return product(shape());
+  }
 
-  bool has_columnwise_data() const noexcept { return columnwise_data.dptr != nullptr; }
+  bool is_empty() const {
+    for (const auto &elem : shape()) {
+      if (elem == 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  NVTEScalingMode scaling_mode() const {
+    auto visitor = [] (const auto& data) -> NVTEScalingMode {
+      using DataType = std::decay_t<decltype(data)>;
+      if constexpr (std::is_same_v<DataType, SimpleData>) {
+        // Kludge for backward compatibility
+        /// TODO: Remove
+        return NVTE_DELAYED_TENSOR_SCALING;
+      }
+      if constexpr (std::is_same_v<DataType, FP8Data>) {
+        return NVTE_DELAYED_TENSOR_SCALING;
+      }
+      if constexpr (std::is_same_v<DataType, MXFP8Data>) {
+        return NVTE_MXFP8_1D_SCALING;
+      }
+      return NVTE_INVALID_SCALING;
+    };
+    return std::visit(visitor, data);
+  }
+
+  bool has_data() const {
+    if (is_empty()) {
+      return false;
+    }
+    auto visitor = [] (const auto& data) -> bool {
+      using DataType = std::decay_t<decltype(data)>;
+      if constexpr (std::is_same_v<DataType, SimpleData>) {
+        return data.dptr != nullptr;
+      }
+      if constexpr (std::is_same_v<DataType, FP8Data>) {
+        return data.data && data.data->dptr != nullptr;
+      }
+      if constexpr (std::is_same_v<DataType, MXFP8Data>) {
+        return data.row_scaled_data && std::get<0>(*data.row_scaled_data).dtpr != nullptr;
+      }
+      return false;
+    };
+    return std::visit(visitor, data);
+  }
+
+  bool has_columnwise_data() const {
+    if (is_empty()) {
+      return false;
+    }
+    auto visitor = [] (const auto& data) -> bool {
+      using DataType = std::decay_t<decltype(data)>;
+      if constexpr (std::is_same_v<DataType, FP8Data>) {
+        return data.transpose_data && data.transpose_data->dptr != nullptr;
+      }
+      if constexpr (std::is_same_v<DataType, MXFP8Data>) {
+        return data.column_scaled_data && std::get<0>(*data.column_scaled_data).dtpr != nullptr;
+      }
+      return false;
+    };
+    return std::visit(visitor, data);
+  }
 
   DType dtype() const {
-    if (has_data()) return data.dtype;
-    if (has_columnwise_data()) return columnwise_data.dtype;
-    // Fallback, used e.g. in workspace
-    return data.dtype;
+    auto visitor = [] (const auto& data) -> DType {
+      using DataType = std::decay_t<decltype(data)>;
+      if constexpr (std::is_same_v<DataType, SimpleData>) {
+        return data.data.dtype;
+      }
+      if constexpr (std::is_same_v<DataType, FP8Data>) {
+        if (data.data) {
+          return data.data.dtype;
+        } else if (data.transpose_data) {
+          return data.transpose_data.dtype;
+        } else {
+          NVTE_ERROR("Could not determine dtype because "
+                     "FP8 tensor is missing both data and transpose data");
+        }
+      }
+      if constexpr (std::is_same_v<DataType, MXFP8Data>) {
+        if (data.row_scaled_data) {
+          return std::get<0>(*data.row_scaled_data).dtype;
+        } else if (data.column_scaled_data) {
+          return std::get<0>(*data.column_scaled_data).dtype;
+        } else {
+          NVTE_ERROR("Could not determine dtype because "
+                     "MXFP8 tensor is missing both row-scaled data and column-scaled data");
+        }
+      }
+      NVTE_ERROR("Could not determine dtype because tensor format is not supported");
+      return DType::kFloat32;  // dummy
+    };
+    return std::visit(visitor, data);
   }
 
   /*! Matrix height after tensor is flattened to 2D
@@ -128,18 +244,11 @@ struct Tensor {
    * as a (D1*D2*...*D(n-1), Dn) matrix.
    */
   size_t flat_first_dim() const {
-    if (!has_data() && has_columnwise_data()) {
-      const auto &data_shape = columnwise_data.shape;
-      if (data_shape.empty()) return 1;
-      if (scaling_mode == NVTE_DELAYED_TENSOR_SCALING) {
-        return product(data_shape, 1, data_shape.size());
-      } else {
-        return product(data_shape, 0, data_shape.size() - 1);
-      }
+    const auto& full_shape = shape();
+    if (full_shape.empty()) {
+      return 1;
     }
-    const auto &data_shape = data.shape;
-    if (data_shape.empty()) return 1;
-    return product(data_shape, 0, data_shape.size() - 1);
+    return product(full_shape, 0, full_shape.size() - 1);
   }
 
   /*! Matrix width after tensor is flattened to 2D
@@ -148,20 +257,14 @@ struct Tensor {
    * as a (D1*D2*...*D(n-1), Dn) matrix.
    */
   size_t flat_last_dim() const {
-    if (!has_data() && has_columnwise_data()) {
-      const auto &data_shape = columnwise_data.shape;
-      if (data_shape.empty()) return 1;
-      if (scaling_mode == NVTE_DELAYED_TENSOR_SCALING) {
-        return data_shape.front();
-      } else {
-        return data_shape.back();
-      }
+    const auto& full_shape = shape();
+    if (full_shape.empty()) {
+      return 1;
     }
-    const auto &data_shape = data.shape;
-    if (data_shape.empty()) return 1;
-    return data_shape.back();
+    return full_shape.back();
   }
 };
+
 
 template <typename T>
 constexpr T DIVUP(const T &x, const T &y) {

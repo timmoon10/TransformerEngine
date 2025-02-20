@@ -7,6 +7,10 @@
 #include <transformer_engine/transformer_engine.h>
 
 #include <iostream>
+#include <string>
+#include <tuple>
+#include <type_traits>
+#include <variant>
 
 #include "common.h"
 
@@ -57,138 +61,194 @@ std::string to_string(const NVTEScalingMode &mode) {
 }
 
 void CheckNoopTensor(const Tensor &t, const std::string &name) {
-  if (t.data.dptr != nullptr) {
-    NVTE_CHECK(t.numel() == 1, "Expected 1 element for ", name, " noop, but found ", t.numel(),
-               ".");
-    NVTE_CHECK(t.data.dtype == DType::kFloat32, "Found wrong dtype for ", name,
-               " noop. Expected kFloat32.");
+  NVTE_CHECK(t.data.index == 0,
+             "Expected noop tensor \"", name, "\" to have simple data, but found format ",
+             t.data.index, ". Scaling mode is ", to_string(t.scaling_mode()), ".");
+  if (t.has_data()) {
+    NVTE_CHECK(t.numel() == 1,
+               "Expected noop tensor \"", name, "\" to have one entry, but found shape=", t.shape());
+    NVTE_CHECK(t.dtype() == DType::kFloat32,
+               "Expected noop tensor \"", name, "\" to have dtype=Float32, but found dtype=",
+               to_string(t.dtype()));
   }
 }
 
-void CheckScaleTensorShape(const Tensor &t, const std::string &name) {
-  NVTE_CHECK(t.scaling_mode != NVTE_INVALID_SCALING, "Invalid scaling mode!");
-  if (is_tensor_scaling(t.scaling_mode)) {
-    // per-tensor scaling
-    if (t.has_data()) {
-      NVTE_CHECK(t.scale_inv.numel() == 1, "Tensor \"", name,
-                 "\" has invalid scale_inv shape (expected (1), got ", t.scale_inv.shape, ")");
-    }
-    if (t.has_columnwise_data()) {
-      NVTE_CHECK(t.columnwise_scale_inv.numel() == 1, "Tensor \"", name,
-                 "\" has invalid columnwise_scale_inv shape (expected (1), got ",
-                 t.columnwise_scale_inv.shape, ")");
-    }
-  } else {
-    if (t.scaling_mode == NVTE_MXFP8_1D_SCALING) {
-      // Need (4, 128) alignment even for e8 scaling factor
-      auto block_alignment = std::vector<size_t>{128ul, 4ul};
-      size_t expected_x, expected_y, alignment;
+namespace {
 
-      if (t.has_data()) {
-        alignment = block_alignment[0];
-        expected_x =
-            DIVUP(DIVUP(t.flat_first_dim(), static_cast<size_t>(1)), alignment) * alignment;
-        alignment = block_alignment[1];
-        expected_y =
-            DIVUP(DIVUP(t.flat_last_dim(), static_cast<size_t>(32)), alignment) * alignment;
-        const auto &expected = std::vector<size_t>{expected_x, expected_y};
-        NVTE_CHECK(t.scale_inv.shape == expected, "Tensor \"", name,
-                   "\" has invalid scale_inv shape (expected ", expected, ", got ",
-                   t.scale_inv.shape, ")");
+void CheckFP8Tensor(const Tensor &t, const Tensor::FP8Data &data, const std::string &name) {
+  // Either data or transpose data are required
+  NVTE_CHECK(data.data || data.transpose_data,
+             "FP8 tensor \"", name, "\" is missing both data and transpose data");
+
+  // Check data
+  if (data.data) {
+    NVTE_CHECK(data.data->dptr != nullptr,
+               "FP8 tensor \"", name, "\" has unallocated data");
+    NVTE_CHECK(is_fp8_dtype(data.data->dtype),
+               "FP8 tensor \"", name, "\" has data with dtype=", to_string(data.data->dtype));
+  }
+
+  // Check transpose data
+  if (data.transpose_data) {
+    NVTE_CHECK(data.data_transpose->dptr != nullptr,
+               "FP8 tensor \"", name, "\" has unallocated data transpose");
+    NVTE_CHECK(is_fp8_dtype(data.transpose_data->dtype),
+               "FP8 tensor \"", name, "\" has transpose data with dtype=",
+               to_string(data.transpose_data->dtype));
+    const auto& shape = t.shape();
+    const auto& transpose_shape = data.transpose_data->shape;
+    bool is_transpose_shape_valid = shape.size() == transpose_shape.size();
+    if (is_transpose_shape_valid) {
+      for (size_t i=0; i < transpose_shape.size(); i++) {
+        const auto& d1 = transpose_shape[i];
+        const auto& d2 = i == 0 ? shape.back() : shape[i-1];
+        if (d1 != d2) {
+          is_transpose_shape_valid = false;
+          break;
+        }
       }
-      if (t.has_columnwise_data()) {
-        alignment = block_alignment[1];
-        expected_x =
-            DIVUP(DIVUP(t.flat_first_dim(), static_cast<size_t>(32)), alignment) * alignment;
-        alignment = block_alignment[0];
-        expected_y = DIVUP(DIVUP(t.flat_last_dim(), static_cast<size_t>(1)), alignment) * alignment;
-        const auto &expected = std::vector<size_t>{expected_x, expected_y};
-        NVTE_CHECK(t.columnwise_scale_inv.shape == expected, "Tensor \"", name,
-                   "\"  has invalid columnwise_scale_inv shape (expected ", expected, ", got ",
-                   t.columnwise_scale_inv.shape, ")");
-      }
+    }
+    NVTE_CHECK(!is_transpose_shape_valid,
+               "FP8 tensor \"", name, "\" has transpose data with invalid shape (data has shape=",
+               shape, ", data transpose has shape=", transpose_shape, ")");
+  }
+
+  // Check scale-inverse
+  NVTE_CHECK(data.scale_inv.dptr != nullptr,
+             "FP8 tensor \"", name, "\" has unallocated scale-inverse");
+  NVTE_CHECK(data.scale_inv.numel() == 1,
+             "FP8 tensor \"", name, "\" has invalid scale-inverse shape (expected (1), got ",
+             data.scale_inv.shape, ")");
+  NVTE_CHECK(data.scale_inv.dtype == DType::kFloat32,
+             "FP8 tensor \"", name, "\" has invalid scale-inverse dtype (expected Float32, got ",
+             to_string(data.scale_inv.dtype));
+
+  // Check scale
+  if (data.scale) {
+    NVTE_CHECK(data.scale->dptr != nullptr,
+               "FP8 tensor \"", name, "\" has unallocated scale");
+    NVTE_CHECK(data.scale->numel() == 1,
+               "FP8 tensor \"", name, "\" has invalid scale shape (expected (1), got ",
+               data.scale->shape, ")");
+    NVTE_CHECK(data.scale->dtype == DType::kFloat32,
+               "FP8 tensor \"", name, "\" has invalid scale dtype (expected Float32, got ",
+               to_string(data.scale->dtype));
+  }
+
+  // Check amax
+  if (data.amax) {
+    NVTE_CHECK(data.amax->dptr != nullptr,
+               "FP8 tensor \"", name, "\" has unallocated amax");
+    NVTE_CHECK(data.amax->numel() == 1,
+               "FP8 tensor \"", name, "\" has invalid amax shape (expected (1), got ",
+               data.amax->shape, ")");
+    NVTE_CHECK(data.amax->dtype == DType::kFloat32,
+               "FP8 tensor \"", name, "\" has invalid amax dtype (expected Float32, got ",
+               to_string(data.amax->dtype));
+  }
+}
+
+void CheckMXFP8Tensor(const Tensor &t, const Tensor::MXFP8Data &data, const std::string &name) {
+  // Either row-scaled data or column-scaled data are required
+  NVTE_CHECK(data.row_scaled_data || data.column_scaled_data,
+             "MXFP8 tensor \"", name,
+             "\" is missing both row-scaled data and column-scaled data");
+
+  // Data dimensions must be divisible by 32
+  const size_t flat_x = t.flat_first_dim();
+  const size_t flat_y = t.flat_last_dim();
+  NVTE_CHECK(flat_x % 32 == 0 && flat_y % 32 == 0, "MXFP8 tensor \"", name,
+             "\" requires dims that are divisible by 32, but got shape=", t.shape());
+
+  // Check row-scaled data
+  if (data.row_scaled_data) {
+    SimpleTensor fp8_data, scale_inv;
+    std::tie(fp8_data, scale_inv) = *data.row_scaled_data;
+
+    // Check row-scaled FP8 data
+    NVTE_CHECK(fp8_data.dptr != nullptr,
+               "MXFP8 tensor \"", name, "\" has unallocated row-scaled data");
+    NVTE_CHECK(is_fp8_dtype(fp8_data.dtype),
+               "MXFP8 tensor \"", name, "\" has row-scaled data with dtype=",
+               to_string(fp8_data.dtype));
+
+    // Check scale-inverse for row-scaled data
+    NVTE_CHECK(scale_inv.dptr != nullptr, "MXFP8 tensor \"", name,
+               "\" has unallocated scale-inverses for row-scaled data");
+    NVTE_CHECK(scale_inv.dtype == DType::kFloat8EM0,
+               "MXFP8 tensor \"", name, "\" has invalid scale-inverses for row-scaled data ",
+               "(expected dtype=Float8E8M0, got dtype=", to_string(scale_inv.dtype), ")");
+    const size_t alignment_x = 128;
+    const size_t expected_x = DIVUP(DIVUP(flat_x, 1ull), alignment_x) * alignment_x;
+    const size_t alignment_y = 4;
+    const size_t expected_y = DIVUP(DIVUP(flat_y, 32ull), alignment_y) * alignment_y;
+    NVTE_CHECK(scale_inv.shape.size() == 2
+               && scale_inv.shape[0] == expected_x
+               && scale_inv.shape[1] == expected_y,
+               "MXFP8 tensor \"", name, "\" has invalid scale-inverses for row-scaled data "
+               "(expected shape=(", alignment_x, ", ", alignment_y, "), got shape=",
+               scale_inv.shape, ")");
+  }
+
+  // Check column-scaled data
+  if (data.column_scaled_data) {
+    SimpleTensor fp8_data, scale_inv;
+    std::tie(fp8_data, scale_inv) = *data.column_scaled_data;
+
+    // Check column-scaled FP8 data
+    NVTE_CHECK(fp8_data.dptr != nullptr,
+               "MXFP8 tensor \"", name, "\" has unallocated column-scaled data");
+    NVTE_CHECK(is_fp8_dtype(fp8_data.dtype),
+               "MXFP8 tensor \"", name, "\" has column-scaled data with dtype=",
+               to_string(fp8_data.dtype));
+    NVTE_CHECK(fp8_data.shape == t.shape(), "MXFP8 tensor \"", name,
+               "\" has invalid shape for column-scaled data (expected ", t.shape(), ", got ",
+               fp8_data.shape, ")");
+
+    // Check scale-inverse for column-scaled data
+    NVTE_CHECK(scale_inv.dptr != nullptr, "MXFP8 tensor \"", name,
+               "\" has unallocated scale-inverses for column-scaled data");
+    NVTE_CHECK(scale_inv.dtype == DType::kFloat8EM0,
+               "MXFP8 tensor \"", name, "\" has invalid scale-inverses for column-scaled data ",
+               "(expected dtype=Float8E8M0, got dtype=", to_string(scale_inv.dtype), ")");
+    const size_t alignment_x = 4;
+    const size_t expected_x = DIVUP(DIVUP(flat_x, 32ull), alignment_x) * alignment_x;
+    const size_t alignment_y = 128;
+    const size_t expected_y = DIVUP(DIVUP(flat_y, 1ull), alignment_y) * alignment_y;
+    NVTE_CHECK(scale_inv.shape.size() == 2
+               && scale_inv.shape[0] == expected_x
+               && scale_inv.shape[1] == expected_y,
+               "MXFP8 tensor \"", name, "\" has invalid column scale-inverse shape (expected (",
+               alignment_x, ", ", alignment_y, "), got ", scale_inv.shape, ")");
+  }
+}
+
+}  // namespace
+
+void CheckTensor(const Tensor &t, const std::string &name) {
+  auto visitor = [&t, &name] (const auto& data) -> void {
+    using DataType = std::decay_t<decltype(data)>;
+    if constexpr (std::is_same_v<DataType, Tensor::SimpleData>) {
+      NVTE_CHECK(!is_fp8_dtype(data.data.dtype),
+                 "Tensor \"", name, "\" has simple format, but dtype=",
+                 to_string(data.data.dtype));
+    }
+    if constexpr (std::is_same_v<DataType, Tensor::FP8Data>) {
+      CheckFP8Tensor(t, data, name);
+    }
+    if constexpr (std::is_same_v<DataType, Tensor::MXFP8Data>) {
+      CheckMXFP8Tensor(t, data, name);
     }
   }
+  std::visit(visitor, t.data);
 }
 
 void CheckInputTensor(const Tensor &t, const std::string &name) {
-  const DType type = t.dtype();
-  if (is_fp8_dtype(type)) {
-    // FP8 input needs to have scale_inv
-    if (t.has_data()) {
-      NVTE_CHECK(t.scale_inv.dptr != nullptr, "FP8 scaling factor input ", name,
-                 "_scale_inverse must be allocated");
-      NVTE_CHECK(t.scale_inv.dtype == DType::kFloat32 || t.scale_inv.dtype == DType::kFloat8E8M0,
-                 "FP8 scaling factor input ", name,
-                 "_scale_inverse has invalid dtype "
-                 "(expected Float32 or Byte, got ",
-                 to_string(t.scale_inv.dtype), ")");
-    }
-    if (t.has_columnwise_data()) {
-      NVTE_CHECK(t.columnwise_scale_inv.dptr != nullptr, "FP8 scaling factor input ", name,
-                 "_columnwise_scale_inverse must be allocated");
-      NVTE_CHECK(t.columnwise_scale_inv.dtype == DType::kFloat32 ||
-                     t.columnwise_scale_inv.dtype == DType::kFloat8E8M0,
-                 "FP8 scaling factor input ", name,
-                 "_columnwise_scale_inverse has invalid dtype "
-                 "(expected Float32 or Byte, got ",
-                 to_string(t.columnwise_scale_inv.dtype), ")");
-    }
-  } else {
-    NVTE_CHECK(t.scale.dptr == nullptr, "Scale is not supported for non-FP8 input ", name);
-    NVTE_CHECK(t.amax.dptr == nullptr, "Amax is not supported for non-FP8 input ", name);
-    NVTE_CHECK(t.scale_inv.dptr == nullptr, "Scale_inv is not supported for non-FP8 input ", name);
-    NVTE_CHECK(t.columnwise_scale_inv.dptr == nullptr,
-               "Scale_inv is not supported for non-FP8 input ", name);
-  }
-  NVTE_CHECK(t.has_data() || t.has_columnwise_data(), "Input ", name, " is not allocated!");
-
-  CheckScaleTensorShape(t, name);
+  CheckTensor(t, name);
 }
 
-void CheckOutputTensor(const Tensor &t, const std::string &name, bool allow_empty) {
-  const DType type = t.dtype();
-  if (is_fp8_dtype(type)) {
-    // FP8 output needs to have scale, scale_inv and (if delayed scaling) amax
-    if (t.scaling_mode == NVTE_DELAYED_TENSOR_SCALING) {
-      NVTE_CHECK(t.amax.dptr != nullptr, "FP8 output ", name, " must have amax tensor");
-      NVTE_CHECK(t.amax.dtype == DType::kFloat32, "Invalid amax dtype (expected ",
-                 to_string(DType::kFloat32), ", got ", to_string(t.amax.dtype), ")");
-      NVTE_CHECK(product(t.amax.shape) == 1, "Invalid shape of amax in output ", name,
-                 " (expected 1 entry, got shape=", t.amax.shape, ")");
-    }
-    if (t.has_data()) {
-      NVTE_CHECK(t.scale_inv.dptr != nullptr, "FP8 scaling factor output ", name,
-                 "_scale_inverse must be allocated");
-      NVTE_CHECK(t.scale_inv.dtype == DType::kFloat32 || t.scale_inv.dtype == DType::kFloat8E8M0,
-                 "FP8 scaling factor output ", name,
-                 "_scale_inverse has invalid dtype "
-                 "(expected Float32 or Float8E8M0, got ",
-                 to_string(t.scale_inv.dtype), ")");
-    }
-    if (t.has_columnwise_data()) {
-      NVTE_CHECK(t.columnwise_scale_inv.dptr != nullptr, "FP8 scaling factor output ", name,
-                 "_columnwise_scale_inverse must be allocated");
-      NVTE_CHECK(t.columnwise_scale_inv.dtype == DType::kFloat32 ||
-                     t.columnwise_scale_inv.dtype == DType::kFloat8E8M0,
-                 "FP8 scaling factor output ", name,
-                 "_columnwise_scale_inverse has invalid dtype "
-                 "(expected Float32 or Float8E8M0, got ",
-                 to_string(t.columnwise_scale_inv.dtype), ")");
-    }
-  } else {
-    NVTE_CHECK(t.scale.dptr == nullptr, "Scale is not supported for non-FP8 output ", name);
-    NVTE_CHECK(t.amax.dptr == nullptr, "Amax is not supported for non-FP8 output ", name);
-    NVTE_CHECK(t.scale_inv.dptr == nullptr, "Scale_inv is not supported for non-FP8 output ", name);
-    NVTE_CHECK(t.columnwise_scale_inv.dptr == nullptr,
-               "Scale_inv is not supported for non-FP8 input ", name);
-  }
-
-  if (!allow_empty) {
-    NVTE_CHECK(t.has_data() || t.has_columnwise_data(), "Output ", name, " is not allocated!");
-  }
-
-  CheckScaleTensorShape(t, name);
+void CheckOutputTensor(const Tensor &t, const std::string &name) {
+  CheckTensor(t, name);
 }
 
 }  // namespace transformer_engine
