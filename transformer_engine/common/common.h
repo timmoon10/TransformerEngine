@@ -154,8 +154,8 @@ struct Tensor {
     auto visitor = [] (const auto& data) -> NVTEScalingMode {
       using DataType = std::decay_t<decltype(data)>;
       if constexpr (std::is_same_v<DataType, SimpleData>) {
-        // Kludge for backward compatibility
-        /// TODO: Remove
+        // The user-facing API treats simple tensors and FP8 tensors
+        // as the same. Consider adding option for simple tensors.
         return NVTE_DELAYED_TENSOR_SCALING;
       }
       if constexpr (std::is_same_v<DataType, FP8Data>) {
@@ -263,6 +263,37 @@ struct Tensor {
     }
     return full_shape.back();
   }
+
+private:
+
+  /*! Kludge for persistently storing data shape
+   *
+   * The tensor shape class in the user-facing API (NVTEShape) just
+   * consists of a pointer and size, so the shape data must be managed
+   * elsewhere. This is a temporary hack until we make NVTEShape
+   * manage its own memory.
+   */
+  mutable std::vector<size_t> _shape;
+  /*! Kludge for persistently storing column-wise data shape
+   *
+   * The tensor shape class in the user-facing API (NVTEShape) just
+   * consists of a pointer and size, so the shape data must be managed
+   * elsewhere. This is a temporary hack until we make NVTEShape
+   * manage its own memory.
+   */
+  mutable std::vector<size_t> _columnwise_shape;
+  /*! Kludge for persistently storing scale-inverse shape
+   *
+   * The tensor shape class in the user-facing API (NVTEShape) just
+   * consists of a pointer and size, so the shape data must be managed
+   * elsewhere. This is a temporary hack until we make NVTEShape
+   * manage its own memory.
+   */
+  mutable std::vector<size_t> _scale_inv_shape;
+
+  friend NVTEShape nvte_tensor_shape(const NVTETensor tensor);
+  friend NVTEShape nvte_tensor_columnwise_shape(const NVTETensor tensor);
+
 };
 
 

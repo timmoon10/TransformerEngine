@@ -255,7 +255,19 @@ void CheckOutputTensor(const Tensor &t, const std::string &name) {
 
 NVTETensor nvte_create_tensor(NVTEScalingMode scaling_mode) {
   transformer_engine::Tensor *ret = new transformer_engine::Tensor;
-  ret->scaling_mode = scaling_mode;
+  switch (scaling_mode) {
+  case NVTE_DELAYED_TENSOR_SCALING:
+    // The user-facing API treats simple tensors and FP8 tensors as
+    // the same. For now we initialize an FP8 tensor as the default,
+    // but consider adding option for simple tensors.
+    ret->data = Tensor::FP8Data{};
+    break;
+  case NVTE_MXFP8_1D_SCALING:
+    ret->data = Tensor::MXFP8Data{};
+    break;
+  default:
+    NVTE_ERROR("Unexpected scaling mode (", to_string(scaling_mode), ")");
+  }
   return ret;
 }
 
@@ -274,147 +286,354 @@ NVTEDType nvte_tensor_type(const NVTETensor tensor) {
 NVTEShape nvte_tensor_shape(const NVTETensor tensor) {
   if (tensor == nullptr) return {nullptr, 0};
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
+  t._shape = t.shape();
   NVTEShape ret;
-
-  // FP8 tensor keeps shape in rowwise data
-  if (t.scaling_mode == NVTE_DELAYED_TENSOR_SCALING) {
-    ret.data = t.data.shape.data();
-    ret.ndim = t.data.shape.size();
-    return ret;
-  }
-
-  // Get shape based on what data is available
-  if (t.has_data()) {
-    ret.data = t.data.shape.data();
-    ret.ndim = t.data.shape.size();
-    return ret;
-  }
-  if (t.has_columnwise_data()) {
-    ret.data = t.columnwise_data.shape.data();
-    ret.ndim = t.columnwise_data.shape.size();
-    return ret;
-  }
-
-  // Tensor has no data
-  ret.data = t.data.shape.data();
-  ret.ndim = t.data.shape.size();
+  ret.data = t._shape.data();
+  ret.ndim = t._shape.size();
   return ret;
 }
 
 NVTEShape nvte_tensor_columnwise_shape(const NVTETensor tensor) {
   if (tensor == nullptr) return {nullptr, 0};
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
+  const auto& shape = t.shape();
+  t._columnwise_shape.clear();
+  if (!shape.empty()) {
+    t._columnwise_shape.push_back(shape.back());
+    for (size_t i=0; i < shape.size() - 1; i++) {
+      t._columnwise_shape.push_back(shape[i]);
+    }
+  }
   NVTEShape ret;
-  ret.data = t.columnwise_data.shape.data();
-  ret.ndim = t.columnwise_data.shape.size();
+  ret.data = t._columnwise_shape.data();
+  ret.ndim = t._columnwise_shape.size();
   return ret;
 }
 
 size_t nvte_tensor_ndim(const NVTETensor tensor) {
   if (tensor == nullptr) return 0;
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  return t.data.shape.size();
+  return t.shape().size();
 }
 
 size_t nvte_tensor_size(const NVTETensor tensor, const size_t dim) {
   if (tensor == nullptr) return 0;
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  NVTE_CHECK(dim >= 0 && dim < t.data.shape.size(), "Invalid dimension index: ", dim);
-  return t.data.shape[dim];
+  const auto &shape = t.shape();
+  NVTE_CHECK(dim >= 0 && dim < shape.size(),
+             "Attempted to access dim ", dim, " in a ", shape.size(), "-D tensor");
+  return shape[dim];
 }
 
 size_t nvte_tensor_numel(const NVTETensor tensor) {
   if (tensor == nullptr) return 0;
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  size_t numel = 1;
-  for (auto size : t.data.shape) {
-    numel *= size;
-  }
-  return numel;
+  return t.numel();
 }
 
 size_t nvte_tensor_element_size(const NVTETensor tensor) {
   if (tensor == nullptr) return sizeof(float);
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  return transformer_engine::typeToSize(t.data.dtype);
+  return transformer_engine::typeToSize(t.dtype());
 }
 
 void *nvte_tensor_data(const NVTETensor tensor) {
   if (tensor == nullptr) return nullptr;
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  return t.data.dptr;
+  auto visitor = [] (const auto& data) -> void * {
+    using DataType = std::decay_t<decltype(data)>;
+    if constexpr (std::is_same_v<DataType, SimpleData>) {
+      return data.data.dptr;
+    }
+    if constexpr (std::is_same_v<DataType, FP8Data>) {
+      if (data.data) {
+        return data.data->dptr;
+      }
+    }
+    if constexpr (std::is_same_v<DataType, MXFP8Data>) {
+      if (data.row_scaled_data) {
+        return data.row_scaled_data->dptr;
+      }
+    }
+    return nullptr;
+  };
+  return std::visit(visitor, t.data);
 }
 
 void *nvte_tensor_columnwise_data(const NVTETensor tensor) {
   if (tensor == nullptr) return nullptr;
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  return t.columnwise_data.dptr;
+  auto visitor = [] (const auto& data) -> void * {
+    using DataType = std::decay_t<decltype(data)>;
+    if constexpr (std::is_same_v<DataType, FP8Data>) {
+      if (data.transpose_data) {
+        return data.transpose_data->dptr;
+      }
+    }
+    if constexpr (std::is_same_v<DataType, MXFP8Data>) {
+      if (data.column_scaled_data) {
+        return data.column_scaled_data->dptr;
+      }
+    }
+    return nullptr;
+  };
+  return std::visit(visitor, t.data);
 }
 
 float *nvte_tensor_amax(const NVTETensor tensor) {
   if (tensor == nullptr) return nullptr;
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  NVTE_CHECK(t.amax.dtype == transformer_engine::DType::kFloat32,
-             "Tensor's amax must have Float32 type!");
-  return reinterpret_cast<float *>(t.amax.dptr);
+  auto visitor = [&t] (const auto& data) -> float * {
+    using DataType = std::decay_t<decltype(data)>;
+    if constexpr (std::is_same_v<DataType, FP8Data>) {
+      if (data.amax) {
+        NVTE_CHECK(data.amax->numel() == 1,
+                   "FP8 tensor \"", name, "\" has invalid amax shape (expected (1), got ",
+                   data.amax->shape, ")");
+        NVTE_CHECK(data.amax->dtype == DType::kFloat32,
+                   "FP8 tensor \"", name, "\" has invalid amax dtype (expected Float32, got ",
+                   to_string(data.amax->dtype));
+        return reinterpret_cast<float*>(data.amax->dptr);
+      } else {
+        return static_cast<float*>(nullptr);
+      }
+    }
+    NVTE_ERROR("Attempted to access amax pointer, which is only supported for FP8 tensors ",
+               "(scaling mode is ", to_string(t.scaling_mode), ", dtype is ", to_string(t.dtype()),
+               ")");
+    return static_cast<float*>(nullptr);  // dummy
+  };
+  return std::visit(visitor, t.data);
 }
 
 float *nvte_tensor_scale(const NVTETensor tensor) {
   if (tensor == nullptr) return nullptr;
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  NVTE_CHECK(t.scale.dtype == transformer_engine::DType::kFloat32,
-             "Tensor's scale must have Float32 type!");
-  return reinterpret_cast<float *>(t.scale.dptr);
+  auto visitor = [&t] (const auto& data) -> float * {
+    using DataType = std::decay_t<decltype(data)>;
+    if constexpr (std::is_same_v<DataType, FP8Data>) {
+      if (data.scale) {
+        NVTE_CHECK(data.scale->numel() == 1,
+                   "FP8 tensor \"", name, "\" has invalid scale shape (expected (1), got ",
+                   data.scale->shape, ")");
+        NVTE_CHECK(data.scale->dtype == DType::kFloat32,
+                   "FP8 tensor \"", name, "\" has invalid scale dtype (expected Float32, got ",
+                   to_string(data.scale->dtype));
+        return reinterpret_cast<float*>(data.scale->dptr);
+      } else {
+        return static_cast<float*>(nullptr);
+      }
+    }
+    NVTE_ERROR("Attempted to access scale pointer, which is only supported for FP8 tensors ",
+               "(scaling mode is ", to_string(t.scaling_mode), ", dtype is ", to_string(t.dtype()),
+               ")");
+    return static_cast<float*>(nullptr);  // dummy
+  };
+  return std::visit(visitor, t.data);
 }
 
 float *nvte_tensor_scale_inv(const NVTETensor tensor) {
   if (tensor == nullptr) return nullptr;
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  return reinterpret_cast<float *>(t.scale_inv.dptr);
+  auto visitor = [&t] (const auto& data) -> float * {
+    using DataType = std::decay_t<decltype(data)>;
+    if constexpr (std::is_same_v<DataType, FP8Data>) {
+      NVTE_CHECK(data.scale_inv.numel() == 1,
+                 "FP8 tensor \"", name, "\" has invalid scale shape (expected (1), got ",
+                 data.scale_inv.shape, ")");
+      NVTE_CHECK(data.scale_inv.dtype == DType::kFloat32,
+                 "FP8 tensor \"", name, "\" has invalid scale dtype (expected Float32, got ",
+                 to_string(data.scale_inv.dtype));
+      return reinterpret_cast<float*>(data.scale_inv.dptr);
+    }
+    if constexpr (std::is_same_v<DataType, MXFP8Data>) {
+      if (data.row_scaled_data) {
+        const auto& scale_inv = std::get<1>(*data.row_scaled_data);
+        NVTE_CHECK(scale_inv.dtype == DType::kFloat8EM0,
+                   "MXFP8 tensor \"", name, "\" has invalid scale-inverses for row-scaled data ",
+                   "(expected dtype=Float8E8M0, got dtype=", to_string(scale_inv.dtype), ")");
+        return reinterpret_cast<float*>(scale_inv.dptr);  // TODO Change API to output void*
+      } else {
+        return static_cast<float*>(nullptr);
+      }
+    }
+    NVTE_ERROR("Attempted to access scale-inverse pointer, which is only supported for "
+               "FP8 or MXFP8 tensors (scaling mode is ", to_string(t.scaling_mode), ", dtype is ",
+               to_string(t.dtype()), ")");
+    return static_cast<float*>(nullptr);  // dummy
+  };
+  return std::visit(visitor, t.data);
 }
 
 void *nvte_tensor_columnwise_scale_inv(const NVTETensor tensor) {
   if (tensor == nullptr) return nullptr;
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  return t.columnwise_scale_inv.dptr;
+  auto visitor = [&t] (const auto& data) -> void * {
+    using DataType = std::decay_t<decltype(data)>;
+    if constexpr (std::is_same_v<DataType, FP8Data>) {
+      NVTE_CHECK(data.scale_inv.numel() == 1,
+                 "FP8 tensor \"", name, "\" has invalid scale shape (expected (1), got ",
+                 data.scale_inv.shape, ")");
+      NVTE_CHECK(data.scale_inv.dtype == DType::kFloat32,
+                 "FP8 tensor \"", name, "\" has invalid scale dtype (expected Float32, got ",
+                 to_string(data.scale_inv.dtype));
+      return reinterpret_cast<float*>(data.scale_inv.dptr);
+    }
+    if constexpr (std::is_same_v<DataType, MXFP8Data>) {
+      if (data.column_scaled_data) {
+        const auto& scale_inv = std::get<1>(*data.column_scaled_data);
+        NVTE_CHECK(scale_inv.dtype == DType::kFloat8EM0,
+                   "MXFP8 tensor \"", name, "\" has invalid scale-inverses for column-scaled data ",
+                   "(expected dtype=Float8E8M0, got dtype=", to_string(scale_inv.dtype), ")");
+        return reinterpret_cast<float*>(scale_inv.dptr);  // TODO Change API to return void*
+      } else {
+        return static_cast<float*>(nullptr);
+      }
+    }
+    NVTE_ERROR("Attempted to access column-wise scale-inverse pointer, "
+               "which is only supported for FP8 and MXFP8 tensors (scaling mode is ",
+               to_string(t.scaling_mode), ", dtype is ", to_string(t.dtype()), ")");
+    return nullptr;  // dummy
+  };
+  return std::visit(visitor, t.data);
 }
 
 NVTEShape nvte_tensor_scale_inv_shape(const NVTETensor tensor) {
   if (tensor == nullptr) return {nullptr, 0};
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
+  auto visitor = [&t] (const auto& data) -> std::vector<size_t> {
+    using DataType = std::decay_t<decltype(data)>;
+    if constexpr (std::is_same_v<DataType, FP8Data>) {
+      NVTE_CHECK(data.scale_inv.numel() == 1,
+                 "FP8 tensor \"", name, "\" has invalid scale shape (expected (1), got ",
+                 data.scale_inv.shape, ")");
+      return data.scale_inv.shape;
+    }
+    if constexpr (std::is_same_v<DataType, MXFP8Data>) {
+      if (data.row_scaled_data) {
+        const auto& scale_inv = std::get<1>(*data.row_scaled_data);
+        return scale_inv.shape;
+      } else {
+        return {0ull};
+      }
+    }
+    NVTE_ERROR("Attempted to access scale-inverse pointer, which is only supported for "
+               "FP8 or MXFP8 tensors (scaling mode is ", to_string(t.scaling_mode), ", dtype is ",
+               to_string(t.dtype()), ")");
+    return {0ull};  // dummy
+  };
+  t._scale_inv_shape = std::visit(visitor, t.data);
   NVTEShape ret;
-  ret.data = t.scale_inv.shape.data();
-  ret.ndim = t.scale_inv.shape.size();
+  ret.data = t._scale_inv_shape.data();
+  ret.ndim = t._scale_inv_shape.size();
   return ret;
 }
 
-void nvte_set_tensor_param(NVTETensor *tensor, NVTETensorParam param_name,
-                           const NVTEBasicTensor *param) {
-  NVTE_CHECK(tensor != nullptr, "Tensor pointer can't be NULL.");
-  NVTE_CHECK(*tensor != nullptr, "Tensor is not allocated.");
-  auto &t = *reinterpret_cast<transformer_engine::Tensor *>(*tensor);
+namespace transformer_engine {
+namespace {
+
+void set_fp8_tensor_param(Tensor::FP8Data &data, NVTETensorParam param_name, BasicTensor &&param) {
   switch (param_name) {
     case kNVTERowwiseData:
-      t.data = *param;
+      data.data = std::move(param);
       break;
     case kNVTEColumnwiseData:
-      t.columnwise_data = *param;
+      data.transpose_data = std::move(param);
       break;
     case kNVTEScale:
-      t.scale = *param;
+      data.scale = std::move(param);
       break;
     case kNVTEAmax:
-      t.amax = *param;
+      data.amax = std::move(param);
       break;
     case kNVTERowwiseScaleInv:
-      t.scale_inv = *param;
-      break;
     case kNVTEColumnwiseScaleInv:
-      t.columnwise_scale_inv = *param;
+      data.scale_inv = std::move(param);
       break;
     default:
-      NVTE_ERROR("Unknown tensor parameter!");
+      NVTE_ERROR("Unsupported parameter for FP8 tensor (", (int)param_name, ")");
   }
+}
+
+void set_mxfp8_tensor_param(Tensor::MXFP8Data &data, NVTETensorParam param_name, BasicTensor &&param) {
+  auto maybe_make_row_scaled_data = [&data] () -> void {
+    if (!data.row_scaled_data) {
+      data.row_scaled_data.emplace(std::make_tuple(SimpleTensor{}, SimpleTensor{}));
+    }
+  };
+  auto maybe_make_column_scaled_data = [&data] () -> void {
+    if (!data.column_scaled_data) {
+      data.column_scaled_data.emplace(std::make_tuple(SimpleTensor{}, SimpleTensor{}));
+    }
+  };
+  switch (param_name) {
+    case kNVTERowwiseData:
+      maybe_make_row_scaled_data()
+      std::get<0>(*data.row_scaled_data) = std::move(param);
+      break;
+    case kNVTEColumnwiseData:
+      maybe_make_column_scaled_data()
+      std::get<0>(*data.column_scaled_data) = std::move(param);
+      break;
+    case kNVTERowwiseScaleInv:
+      maybe_make_row_scaled_data()
+      std::get<1>(*data.row_scaled_data) = std::move(param);
+      break;
+    case kNVTEColumnwiseScaleInv:
+      maybe_make_column_scaled_data()
+      std::get<1>(*data.column_scaled_data) = std::move(param);
+      break;
+    default:
+      NVTE_ERROR("Unsupported parameter for MXFP8 tensor (", (int)param_name, ")");
+  }
+}
+
+}  // namespace
+}  // namespace transformer_engine
+
+void nvte_set_tensor_param(NVTETensor *tensor, NVTETensorParam param_name,
+                           const NVTEBasicTensor *param) {
+  NVTE_CHECK(tensor != nullptr, "Got null pointer to tensor.");
+  NVTE_CHECK(*tensor != nullptr, "Tensor is not allocated.");
+  NVTE_CHECK(param != nullptr, "Got null pointer to param.");
+  auto &t = *reinterpret_cast<transformer_engine::Tensor *>(*tensor);
+  SimpleTensor p = *param;
+
+  // The user-facing API treats simple tensors and FP8 tensors as the
+  // same, so the intended layout is ambiguous at construction time.
+  // Reset the layout data if the user-provided param is not
+  // compatible.
+  if (t.scaling_mode() == NVTE_DELAYED_TENSOR_SCALING) {
+    if (t.data.index == 1 && param_name == kNVTERowwiseData && !is_fp8_dtype(p.dtype)) {
+      // FP8 tensor only supports FP8 data. Make simple tensor if
+      // non-FP8 data is provided.
+      t.data = Tensor::SimpleData{};
+    }
+    if (t.data.index == 0 && (param_name != kNVTERowwiseData || is_fp8_dtype(p.dtype))) {
+      // Simple tensor only supports a single data tensor with non-FP8
+      // dtype. Make FP8 tensor if anything else is provided.
+      t.data = Tensor::FP8Data{};
+    }
+  }
+
+  // Visitor pattern to set tensor param
+  auto visitor = [&t, &param_name, &p] (const auto& data) -> std::vector<size_t> {
+    using DataType = std::decay_t<decltype(data)>;
+    if constexpr (std::is_same_v<DataType, SimpleData>) {
+      if (param_name == kNVTERowwiseData) {
+        data.data = std::move(p);
+      } else {
+        NVTE_ERROR("Unsupported parameter for simple tensor (", (int)param_name, ")");
+      }
+    } else if constexpr (std::is_same_v<DataType, FP8Data>) {
+      set_fp8_tensor_param(data, param_name, std::move(p));
+    } else if constexpr (std::is_same_v<DataType, FP8Data>) {
+      set_mxfp8_tensor_param(data, param_name, std::move(p));
+    } else {
+      NVTE_ERROR("Could set tensor parameter because tensor format is not supported");
+    }
+  };
+  std::visit(visitor, t.data);
 }
 
 NVTEBasicTensor nvte_get_tensor_param(const NVTETensor tensor, NVTETensorParam param_name) {
@@ -441,8 +660,9 @@ NVTEBasicTensor nvte_get_tensor_param(const NVTETensor tensor, NVTETensorParam p
 }
 
 NVTEScalingMode nvte_tensor_scaling_mode(const NVTETensor tensor) {
+  /// TODO Impl
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
-  return t.scaling_mode;
+  return t.scaling_mode();
 }
 
 void nvte_tensor_pack_create(NVTETensorPack *pack) {
@@ -459,6 +679,7 @@ void nvte_tensor_pack_destroy(NVTETensorPack *pack) {
 }
 
 void nvte_zero_tensor(const NVTETensor tensor, cudaStream_t stream) {
+  /// TODO Impl
   const auto &t = *reinterpret_cast<const transformer_engine::Tensor *>(tensor);
   // Zero out tensor data if allocated
   if (t.data.dptr != nullptr) {
