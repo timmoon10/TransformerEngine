@@ -295,6 +295,7 @@ class BasicLinear(BasicOperation):
                 rowwise=True,
                 columnwise=torch.is_grad_enabled(),
             )
+            quantizer.internal = False
             with torch.no_grad():
                 weight = quantizer(weight)
 
@@ -925,7 +926,7 @@ class BasicLinear(BasicOperation):
             dtype = torch.get_autocast_dtype("cuda")
 
         # Linear forward
-        output, x_local, w = BasicLinear._functional_forward(
+        output, x_local, _ = BasicLinear._functional_forward(
             input=input_,
             weight=self.weight,
             dtype=dtype,
@@ -936,12 +937,12 @@ class BasicLinear(BasicOperation):
             input_quantizer=input_quantizer,
             weight_quantizer=weight_quantizer,
             output_quantizer=output_quantizer,
-            input_requires_grad=input_requires_grad,
+            input_requires_grad=False,  # Not needed since we don't cache returned weight tensor
             weight_requires_grad=weight_requires_grad,
         )
 
         # Save state for backward pass
-        ctx.save_for_backward(x_local, w)
+        ctx.save_for_backward(x_local, self.weight)
         ctx.with_quantized_compute = with_quantized_compute
         ctx.input_quantizer = input_quantizer
         ctx.weight_quantizer = weight_quantizer

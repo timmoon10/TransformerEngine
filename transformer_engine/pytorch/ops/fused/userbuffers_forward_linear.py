@@ -352,15 +352,14 @@ class UserbuffersForwardLinear(FusedOperation):
             input_quantizer=input_quantizer,
             weight_quantizer=weight_quantizer,
             output_quantizer=None,  # Not supported
-            input_requires_grad=input_requires_grad,
+            input_requires_grad=False,  # Not needed since we don't cache returned weight tensor
             weight_requires_grad=weight_requires_grad,
             ub_comm_name=linear_op._userbuffers_options["comm_name"],
         )
         x_local = extra_outputs["input"]
-        w = extra_outputs["weight"]
 
         # Save state for backward pass
-        linear_op_ctx.save_for_backward(x_local, w)
+        linear_op_ctx.save_for_backward(x_local, linear_op.weight)
         linear_op_ctx.with_quantized_compute = with_quantized_compute
         linear_op_ctx.input_quantizer = input_quantizer
         linear_op_ctx.weight_quantizer = weight_quantizer
