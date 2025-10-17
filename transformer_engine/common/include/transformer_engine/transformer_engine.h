@@ -472,11 +472,11 @@ class TensorWrapper {
     tensor_ = nvte_create_tensor(scaling_mode);
     NVTEBasicTensor data = {dptr, static_cast<NVTEDType>(dtype), shape};
     nvte_set_tensor_param(&tensor_, kNVTERowwiseData, &data);
-    NVTEBasicTensor amax = {amax_dptr, kNVTEFloat32, defaultShape};
+    NVTEBasicTensor amax = {amax_dptr, kNVTEFloat32, amax_dptr == nullptr ? emptyShape : defaultShape};
     nvte_set_tensor_param(&tensor_, kNVTEAmax, &amax);
-    NVTEBasicTensor scale = {scale_dptr, kNVTEFloat32, defaultShape};
+    NVTEBasicTensor scale = {scale_dptr, kNVTEFloat32, scale_dptr == nullptr ? emptyShape : defaultShape};
     nvte_set_tensor_param(&tensor_, kNVTEScale, &scale);
-    NVTEBasicTensor scale_inv = {scale_inv_dptr, kNVTEFloat32, scale_inv_shape};
+    NVTEBasicTensor scale_inv = {scale_inv_dptr, kNVTEFloat32, scale_inv_dptr == nullptr ? emptyShape : scale_inv_shape};
     nvte_set_tensor_param(&tensor_, kNVTERowwiseScaleInv, &scale_inv);
   }
 
@@ -780,6 +780,8 @@ class TensorWrapper {
   static constexpr size_t defaultData = 1;
   static constexpr NVTEShape defaultShape = {
       {defaultData, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 1};
+  static constexpr NVTEShape emptyShape = {
+      {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 1};
 
  private:
   NVTEShape convertShape(const NVTEShape &s) { return s; }

@@ -142,7 +142,13 @@ std::optional<at::Tensor> multi_tensor_swizzle_scaling_factors(
     auto& tensor = tensors[i];
     void* scale_inv_dptr = scale_inv_dptrs[i];
     void* swizzled_scale_inv_dptr = getDataPtr(buffer, scale_inv_offsets[i]);
-    // auto input_shape = nvte_shape_to_vector(tensor.shape());
+
+    // Empty tensors don't require scale swizzling
+    if (tensor.numel() == 0) {
+      continue;
+    }
+
+    // Tensor shape
     NVTEShape nvte_input_shape;
     if (rowwise) {
       nvte_input_shape = tensor.shape();
@@ -150,6 +156,7 @@ std::optional<at::Tensor> multi_tensor_swizzle_scaling_factors(
       nvte_input_shape = tensor.get_columnwise_data().shape;
     }
     auto input_shape = nvte_shape_to_vector(nvte_input_shape);
+
     // Reconstruct input only to avoid swizzling both directions if not needed.
     // Use any 8 bit type, it's irrelevant.
     transformer_engine::TensorWrapper input_cu(scaling_mode);
@@ -202,14 +209,14 @@ at::Tensor convert_block_scaling_to_mxfp8_tensor(transformer_engine::TensorWrapp
   size_t data_flat_last_dim = 1;
   if (rowwise) {
     data = input.get_rowwise_data();
-    for (int i = 0; i < data.shape.ndim - 1; ++i) {
+    for (size_t i = 0; i < data.shape.ndim - 1; ++i) {
       data_flat_first_dim *= data.shape.data[i];
     }
     data_flat_last_dim = data.shape.data[data.shape.ndim - 1];
   } else {
     data = input.get_columnwise_data();
     data_flat_first_dim = data.shape.data[0];
-    for (int i = 1; i < data.shape.ndim; ++i) {
+    for (size_t i = 1; i < data.shape.ndim; ++i) {
       data_flat_last_dim *= data.shape.data[i];
     }
   }

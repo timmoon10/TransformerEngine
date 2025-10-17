@@ -1948,6 +1948,10 @@ def test_grouped_linear_accuracy(
         if use_cutlass:
             torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
         else:
+
+            ### TODO Remove
+            print(f"{o=}\n{o_ref=}")
+
             # cuBLAS implementation should be bit-wise match
             torch.testing.assert_close(o, o_ref, rtol=0, atol=0)
 
