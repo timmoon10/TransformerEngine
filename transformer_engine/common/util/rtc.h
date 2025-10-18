@@ -66,6 +66,29 @@ class Kernel {
                                 static_cast<CUstream>(stream), arg_ptrs, nullptr);
   }
 
+  /*! \brief Launch CUDA cooperative kernel
+   *
+   * Loads the kernel into the device the first time the device is
+   * accessed.
+   *
+   * \param[in] device_id        CUDA device
+   * \param[in] grid_dim         Grid dimensions in blocks
+   * \param[in] block_dim        Thread block dimensions
+   * \param[in] shared_mem_bytes Dynamic shared-memory size per thread block in
+   *                             bytes
+   * \param[in] stream           CUDA stream
+   * \param[in] args             Kernel arguments
+   */
+  template <typename... ArgTs>
+  void launch_cooperative(int device_id, const dim3 grid_dim, const dim3 block_dim,
+                          unsigned int shared_mem_bytes, cudaStream_t stream, ArgTs &&...args) {
+    cuda_driver::ensure_context_exists();
+    void *arg_ptrs[] = {const_cast<void *>(static_cast<const void *>(&args))...};
+    NVTE_CALL_CHECK_CUDA_DRIVER(cuLaunchCooperativeKernel, get_function(device_id), grid_dim.x, grid_dim.y,
+                                grid_dim.z, block_dim.x, block_dim.y, block_dim.z, shared_mem_bytes,
+                                static_cast<CUstream>(stream), arg_ptrs, nullptr);
+  }
+
   /*! \brief CUDA function for given CUDA device
    *
    * Loads the kernel into the device the first time the device is
@@ -75,9 +98,19 @@ class Kernel {
 
   /*! \brief Sets the preferred cache configuration for a function
    *
-   * Wrapper of the CUDA Driver API function "cuFuncSetCacheConfig"
+   * Wrapper for the CUDA Driver API function "cuFuncSetCacheConfig".
    */
   void set_function_cache_config(int device_id, CUfunc_cache cache_config);
+
+  /*! \brief Get occupancy of a function.
+   *
+   * Wrapper for the CUDA Driver API function
+   * cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags.
+   */
+  int occupancy_max_active_blocks_per_multiprocessor(const std::string& kernel_label,
+                                                     int block_size,
+                                                     size_t dynamic_shared_memory_size,
+                                                     unsigned int flags = CU_OCCUPANCY_DEFAULT);
 
  private:
   /*! \brief Mangled function name */

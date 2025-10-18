@@ -221,6 +221,20 @@ void KernelManager::set_cache_config(const std::string& kernel_label, CUfunc_cac
   kernel_cache_.at(key).set_function_cache_config(device_id, cache_config);
 }
 
+int KernelManager::occupancy_max_active_blocks_per_multiprocessor(const std::string& kernel_label,
+                                                                   int block_size,
+                                                                   size_t dynamic_shared_memory_size,
+                                                                   unsigned int flags) {
+  const int device_id = cuda::current_device();
+  const auto key = get_kernel_cache_key(kernel_label, device_id);
+  NVTE_CHECK(kernel_cache_.count(key) > 0, "Could not find compiled RTC kernel with key=", key);
+  const auto &kernel = kernel_cache_.at(key).get_function(device_id);
+  int num_blocks;
+  NVTE_CALL_CHECK_CUDA_DRIVER(cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags,
+                              &num_blocks, kernel, block_size, dynamic_shared_memory_size, flags);
+  return num_blocks;
+}
+
 bool KernelManager::is_compiled(const std::string& kernel_label, int device_id) const {
   const auto key = get_kernel_cache_key(kernel_label, device_id);
   return kernel_cache_.count(key) > 0;

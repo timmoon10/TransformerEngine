@@ -10,6 +10,13 @@
 
 using namespace transformer_engine::normalization;
 
+namespace {
+
+// String with RTC kernel implementation
+#include "string_code_normalization_rmsnorm_rtc_forward_cu.h"
+
+}  // namespace
+
 template <typename weight_t, typename input_t, typename output_t, typename compute_t,
           typename index_t, int HIDDEN_SIZE, int CTAS_PER_ROW, int WARPS_M, int WARPS_N,
           int BYTES_PER_LDG>
@@ -17,6 +24,31 @@ void launch_rmsnorm_fwd_tuned_(LaunchParams<ForwardKernelParams> &launch_params,
                                const bool configure_params) {  // NOLINT(*)
   using Kernel_traits = Kernel_traits<weight_t, input_t, output_t, compute_t, index_t, HIDDEN_SIZE,
                                       CTAS_PER_ROW, WARPS_M, WARPS_N, BYTES_PER_LDG>;
+
+  auto &rtc_manager = rtc::KernelManager::instance();
+
+  const std::string kernel_label = concat_strings(
+      "rmsnorm_forward"
+      ",type="); /// TODO Impl
+  if (!rtc_manager.is_compiled(kernel_label)) {
+    std::string code = string_code_normalization_rmsnorm_rtc_forward_cu;
+    code = regex_replace(code, "__INPUT_TYPE__", ???);
+    code = regex_replace(code, "__WEIGHT_TYPE__", ???);
+    code = regex_replace(code, "__OUTPUT_TYPE__", ???);
+    code = regex_replace(code, "__VECTOR_SIZE__", ???);
+    code = regex_replace(code, "__BLOCK_DIM_X__", ???);
+    code = regex_replace(code, "__BLOCK_DIM_Y__", ???);
+    code = regex_replace(code, "__NUM_COLS__", HIDDEN_SIZE);
+    code = regex_replace(code, "__BLOCKS_PER_ROW__", CTAS_PER_ROW);
+    code = regex_replace(code, "__WITH_OUT_SCALE__", ???);
+    code = regex_replace(code, "__WITH_AMAX__", ???);
+    code = regex_replace(code, "__ZERO_CENTERED_GAMMA__", ???);
+
+  }
+
+  /// TODO Remove
+
+
   auto kernel = &rmsnorm_fwd_tuned_kernel<Kernel_traits>;
 
   if (configure_params) {
