@@ -38,7 +38,7 @@ static_assert(num_cols % blocks_per_row == 0);
 constexpr index_t cols_per_block = num_cols / blocks_per_row;
 static_assert(cols_per_block % bdim_x == 0);
 constexpr index_t elements_per_thread = cols_per_block / bdim_x;
-static_assert(elements_per_thread / vector_size == 0);
+static_assert(elements_per_thread % vector_size == 0);
 constexpr index_t vectors_per_thread = elements_per_thread / vector_size;
 
 // Tensor scaling options
@@ -46,7 +46,7 @@ constexpr bool with_out_scale = __WITH_OUT_SCALE__;
 constexpr bool with_amax = __WITH_AMAX__;
 
 // Other options
-constexpr bool with_zero_centered_gamma = __WITH_ZERO_CENTERED_GAMMA__;
+constexpr bool zero_centered_gamma = __ZERO_CENTERED_GAMMA__;
 
 }  // namespace
 
@@ -76,12 +76,12 @@ __global__ __launch_bounds__(bdim_x * bdim_y) void rmsnorm_fwd_tuned_kernel(
   const index_t bid_x = blockIdx.x;
   const index_t bid_y = blockIdx.y;
   const index_t gid_x = tid_x + bid_x * bdim_x;
-  const index_t gid_y = tid_y + bid_y * bdim_x;
+  const index_t gid_y = tid_y + bid_y * bdim_y;
 
   // Warp indices
   const index_t warp_m = tid_y;
   const index_t warp_n = tid_x / THREADS_PER_WARP;
-  const index_t lane = tidx % THREADS_PER_WARP;
+  const index_t lane = tid_x % THREADS_PER_WARP;
 
   // Data offsets
   const index_t row_start = gid_y;
@@ -96,6 +96,7 @@ __global__ __launch_bounds__(bdim_x * bdim_y) void rmsnorm_fwd_tuned_kernel(
   const auto *out_scale_ptr = reinterpret_cast<const compute_t *>(out_scale_ptr_);
   auto *out_scale_inv_ptr = reinterpret_cast<compute_t *>(out_scale_inv_ptr_);
 
+  // Objects for stats reductions
   using Reducer = transformer_engine::Reducer<compute_t, blocks_per_row, num_warps_m, num_warps_n>;
   struct ReducerParams {
     void *workspace;
@@ -104,7 +105,7 @@ __global__ __launch_bounds__(bdim_x * bdim_y) void rmsnorm_fwd_tuned_kernel(
   };
   ReducerParams reducer_params{workspace_ptr, barrier_ptr, blocks_per_col};
   constexpr index_t reducer_smem_size = Reducer::SMEM_BYTES > 0 ? Reducer::SMEM_BYTES : 1;
-  __shared__ uint8_t reducer_smem[smem_size];
+  __shared__ uint8_t reducer_smem[reducer_smem_size];
   Reducer reducer(reducer_params,
                   bid_y, bid_x, warp_m, warp_n, lane, reducer_smem);
 
@@ -120,7 +121,7 @@ __global__ __launch_bounds__(bdim_x * bdim_y) void rmsnorm_fwd_tuned_kernel(
       g[i * vector_size + j] = static_cast<compute_t>(g_in.data.elt[j]);
     }
   }
-  if constexpr (with_zero_centered_gamma) {
+  if constexpr (zero_centered_gamma) {
 #pragma unroll
     for (index_t i = 0; i < elements_per_thread; ++i) {
       g[i] += 1;
@@ -140,7 +141,7 @@ __global__ __launch_bounds__(bdim_x * bdim_y) void rmsnorm_fwd_tuned_kernel(
   }
 
   // Iterate over data rows
-  for (index_t row = row_start; row < num_rows; row += gridDim.y * bdim_y) {
+  for (index_t row = row_start; row < num_rows; row += blocks_per_col * bdim_y) {
     // Pointers for vectorized memory accesses
     const auto *input_vec_ptr = reinterpret_cast<const input_vec_t *>(&input_ptr[row * num_cols + col_start]);
     auto *output_vec_ptr = reinterpret_cast<output_vec_t *>(&output_ptr[row * num_cols + col_start]);
@@ -210,7 +211,7 @@ __global__ __launch_bounds__(bdim_x * bdim_y) void rmsnorm_fwd_tuned_kernel(
 
   // Output amax if needed
   if constexpr (with_amax) {
-    amax = reduce_max<num_warps_m * num_warps_n>(amax, war_n + warp_m * num_warps_n);
+    amax = reduce_max<num_warps_m * num_warps_n>(amax, warp_n + warp_m * num_warps_n);
     if (tid_x == 0 && tid_y == 0) {
       static_assert(std::is_same<compute_t, float>::value);
       atomicMaxFloat(reinterpret_cast<compute_t *>(amax_ptr), amax);

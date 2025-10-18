@@ -241,6 +241,8 @@ make_string_header_from_file(transpose/rtc/transpose.cu
                              string_code_transpose_rtc_transpose_cu)
 make_string_header_from_file(transpose/rtc/swap_first_dims.cu
                              string_code_transpose_rtc_swap_first_dims_cu)
+make_string_header_from_file(normalization/rmsnorm/rtc/forward.cu
+                             string_code_normalization_rmsnorm_rtc_forward_cu)
 make_string_header_from_file(utils.cuh
                              string_code_utils_cuh)
 make_string_header_from_file(util/math.h
