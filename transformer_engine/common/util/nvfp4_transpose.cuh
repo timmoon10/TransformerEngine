@@ -155,8 +155,8 @@ __device__ __forceinline__ uint32_t get_rbits(RNG &rng, uint4 &random_uint4, int
 __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
     const uint64_t in_4x, const float2 scale, const uint32_t rbits) {
   uint16_t out_4x = 0;
-  constexpr bool has_rs = ARCH_HAS_STOCHASTIC_ROUNDING;
-  if constexpr (has_rs) {
+  using CurrentCUDAArch = NVTE_CURRENT_CUDA_ARCH;
+  if constexpr (CurrentCUDAArch::any_compatible<NVTE_CUDA_ARCHS_WITH_STOCHASTIC_ROUNDING>()) {
     asm volatile(
         "{\n"
         ".reg.b64 v01; \n\t"
@@ -195,9 +195,9 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_roun
 __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_rn(const uint64_t in_4x,
                                                                     const float2 scale,
                                                                     const uint32_t rbits) {
-  constexpr bool is_blackwell = ARCH_BLACKWELL_FAMILY;
   uint32_t out_4x = 0;  // Only need 16 bit. Using 32 bit container for packing.
-  if constexpr (is_blackwell) {
+  using CurrentCUDAArch = NVTE_CURRENT_CUDA_ARCH;
+  if constexpr (CurrentCUDAArch::any_compatible<NVTE_CUDA_ARCHS_IN_BLACKWELL_FAMILY>()) {
     // NOTE: rbits unused for rn.
     asm volatile(
         "{\n"
@@ -252,8 +252,8 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x(const uint64_t in_4x
 __device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x_with_stochastic_rounding(
     const float2 in01, const float2 in23, const float2 scale, const uint32_t rbits) {
   uint16_t out_4x = 0;
-  constexpr bool has_rs = ARCH_HAS_STOCHASTIC_ROUNDING;
-  if constexpr (has_rs) {
+  using CurrentCUDAArch = NVTE_CURRENT_CUDA_ARCH;
+  if constexpr (CurrentCUDAArch::any_compatible<NVTE_CUDA_ARCHS_WITH_STOCHASTIC_ROUNDING>()) {
     asm volatile(
         "{\n"
         ".reg.b64 v01; \n\t"
@@ -288,9 +288,9 @@ __device__ __forceinline__ fp4e2m1x4 mul_cvt_fp32_to_fp4_4x_with_rn(const float2
                                                                     const float2 in23,
                                                                     const float2 scale,
                                                                     const uint32_t rbits) {
-  constexpr bool is_blackwell = ARCH_BLACKWELL_FAMILY;
   uint32_t out_4x = 0;  // Only need 16 bit. Using 32 bit container for packing.
-  if constexpr (is_blackwell) {
+  using CurrentCUDAArch = NVTE_CURRENT_CUDA_ARCH;
+  if constexpr (CurrentCUDAArch::any_compatible<NVTE_CUDA_ARCHS_IN_BLACKWELL_FAMILY>()) {
     // NOTE: rbits unused for rn.
     asm volatile(
         "{\n"

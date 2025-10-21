@@ -264,8 +264,8 @@ __device__ __forceinline__ size_t scale_factor_swizzled_offset(size_t row_idx, s
 
 __device__ __forceinline__ __nv_fp4x4_e2m1 cvt_fp32_to_fp4_4x_with_stochastic_rounding(
     const float2 in01, const float2 in23, const uint32_t rbits) {
-  constexpr bool has_rs = ARCH_HAS_STOCHASTIC_ROUNDING;
-  if constexpr (has_rs) {
+  using CurrentCUDAArch = NVTE_CURRENT_CUDA_ARCH;
+  if constexpr (CurrentCUDAArch::any_compatible<NVTE_CUDA_ARCHS_WITH_STOCHASTIC_ROUNDING>()) {
     uint16_t out_4x;
     asm volatile(
         "{\n"
@@ -286,8 +286,8 @@ __device__ __forceinline__ __nv_fp4x4_e2m1 cvt_fp32_to_fp4_4x_with_stochastic_ro
 __device__ __forceinline__ __nv_fp4x4_e2m1 cvt_fp32_to_fp4_4x_with_rn(const float2 in01,
                                                                       const float2 in23,
                                                                       const uint32_t rbits) {
-  constexpr bool has_fp4 = ARCH_BLACKWELL_FAMILY;
-  if constexpr (has_fp4) {
+  using CurrentCUDAArch = NVTE_CURRENT_CUDA_ARCH;
+  if constexpr (CurrentCUDAArch::any_compatible<NVTE_CUDA_ARCHS_IN_BLACKWELL_FAMILY>()) {
     // NOTE: rbits unused for rn.
     uint32_t out_4x;  // Only need 16 bit. Using 32 bit container for packing.
     asm volatile(

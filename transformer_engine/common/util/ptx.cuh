@@ -20,68 +20,93 @@
 
 namespace transformer_engine {
 
-template <int N>
+namespace cuda_arch {
+
+/*! \brief Specification for CUDA arch.
+ *
+ * For compatibility, the current CUDA arch must have compute
+ * capability that matches spec or is newer.
+ */
+template <int ComputeCapability>
 struct Arch {
-  constexpr static int id = N * 10;
-  constexpr static bool is_arch = true;
-  constexpr static bool is_family = false;
+  /// ID corresponding to __CUDA_ARCH__ macro
+  static constexpr int id = ComputeCapability * 10;
 };
 
-template <int CurrentArch, int ArchSpecific, int FamilySpecific, int N>
-struct ArchHelper {
-  constexpr static bool compatible() {
-    if constexpr (CurrentArch == N) {
-      static_assert(ArchSpecific == CurrentArch,
-                    "Compiled for the generic architecture, while utilizing arch-specific "
-                    "features. Please compile for smXXXa architecture instead of smXXX "
-                    "architecture.");
-      return true;
-    } else {
-      return false;
-    }
-  }
+/*! \brief Specification for CUDA arch with arch-specific features.
+ *
+ * For compatibility, the current CUDA arch must have compute
+ * capability that exactly matches spec and must support arch-specific
+ * features.
+ */
+template <int ComputeCapability>
+struct ArchSpecific {
+  /// ID corresponding to __CUDA_ARCH_SPECIFIC__ macro
+  static constexpr int id = ComputeCapability * 10;
 };
 
-template <int N>
-struct Family {
-  constexpr static int id = N * 10;
-  constexpr static bool is_arch = false;
-  constexpr static bool is_family = true;
+/*! \brief Specification for CUDA arch with family-specific features.
+ *
+ * For compatibility, the current CUDA arch must have compute
+ * capability that matches spec family and must support
+ * family-specific features.
+ */
+template <int ComputeCapability>
+struct ArchFamily {
+  /// ID corresponding to __CUDA_ARCH_FAMILY_SPECIFIC__ macro
+  static constexpr int id = ComputeCapability * 10;
 };
 
-template <int CurrentArch, int ArchSpecific, int FamilySpecific, int N>
-struct FamilyHelper {
-  constexpr static bool compatible() {
-    if constexpr ((CurrentArch / 100) == (N / 100)) {
-      static_assert(FamilySpecific == CurrentArch,
-                    "Compiled for the generic architecture, while utilizing family-specific "
-                    "features. Please compile for smXXXf architecture instead of smXXX "
-                    "architecture.");
-      return true;
-    } else {
-      return false;
-    }
-  }
-};
+namespace details {
 
-template <int Arch, int ArchSpecific, int FamilySpecific, class T, class... U>
-constexpr bool is_supported_arch() {
-  constexpr bool compatible = [&] {
-    if constexpr (T::is_arch) {
-      return ArchHelper<Arch, ArchSpecific, FamilySpecific, T::id>::compatible();
-    } else {
-      return FamilyHelper<Arch, ArchSpecific, FamilySpecific, T::id>::compatible();
-    }
-  }();
-  if constexpr (compatible) {
-    return true;
-  } else if constexpr (sizeof...(U) != 0) {
-    return is_supported_arch<Arch, ArchSpecific, FamilySpecific, U...>();
-  } else {
-    return false;
-  }
+template <int ArchId, int ArchSpecificId, int ArchFamilyId>
+struct _CurrentArch;
+
+// Type trait to determine CUDA arch compatibility
+template <typename CurrentArchT, typename ArchT>
+struct IsCompatible : std::false_type {};
+template <int ArchId, int ArchSpecificId, int ArchFamilyId, int ComputeCapability>
+struct IsCompatible<_CurrentArch<ArchId, ArchSpecificId, ArchFamilyId>, Arch<ComputeCapability>>
+  : std::bool_constant<ArchId >= Arch<ComputeCapability>::id> {};
+template <int ArchId, int ArchSpecificId, int ArchFamilyId, int ComputeCapability>
+struct IsCompatible<_CurrentArch<ArchId, ArchSpecificId, ArchFamilyId>, ArchSpecific<ComputeCapability>>
+  : std::bool_constant<ArchSpecificId == ArchSpecific<ComputeCapability>::id> {};
+template <int ArchId, int ArchSpecificId, int ArchFamilyId, int ComputeCapability>
+struct IsCompatible<_CurrentArch<ArchId, ArchSpecificId, ArchFamilyId>, ArchFamily<ComputeCapability>>
+  : std::bool_constant<ArchFamilyId / 100 == ArchFamily<ComputeCapability>::id / 100> {};
+
+/*! \brief CUDA arch that is currently being used by the compiler.
+ *
+ * This class should not be declared directly, but obtained via the
+ * NVTE_CURRENT_CUDA_ARCH macro.
+ */
+template <int ArchId, int ArchSpecificId, int ArchFamilyId>
+struct _CurrentArch {
+
+/// ID corresponding to __CUDA_ARCH__ macro
+constexpr static int arch_id = ArchId;
+/// ID corresponding to __CUDA_ARCH_SPECIFIC__ macro
+constexpr static int arch_specific_id = ArchSpecificId;
+/// ID corresponding to __CUDA_ARCH_SPECIFIC__ macro
+constexpr static int arch_family_id = ArchFamilyId;
+
+/*! /brief Whether current CUDA arch is compatible with a CUDA arch spec */
+template <typename ArchT>
+static inline constexpr bool compatible() {
+  return IsCompatible<_CurrentArch, ArchT>::value;
 }
 
+/*! /brief Whether current CUDA arch is compatible with any CUDA arch spec */
+template <typename... ArchTs>
+static constexpr bool any_compatible() {
+  return (... || compatible<ArchTs>());
+}
+
+};
+
+}  // namespace details
+
+// If needed, define CUDA arch macros in CUDA 12.9+ format
 #if CUDA_VERSION < 12090
 #if __CUDA_ARCH_HAS_FEATURE__(SM90_ALL)
 #define __CUDA_ARCH_SPECIFIC__ 900
@@ -101,35 +126,38 @@ constexpr bool is_supported_arch() {
 #endif
 #endif
 
+// Helper macros for NVTE_CURRENT_CUDA_ARCH
 #ifdef __CUDA_ARCH__
-#define __NVTE_CURRENT_ARCH__ constexpr int current_arch = __CUDA_ARCH__;
+#define _NVTE_CURRENT_CUDA_ARCH_CUDA_ARCH __CUDA_ARCH__
 #else
-#define __NVTE_CURRENT_ARCH__ constexpr int current_arch = 0;
+#define _NVTE_CURRENT_CUDA_ARCH_CUDA_ARCH 0
 #endif
-
 #ifdef __CUDA_ARCH_SPECIFIC__
-#define __NVTE_ARCH_SPECIFIC__ constexpr int ArchSpecific = __CUDA_ARCH_SPECIFIC__;
+#define _NVTE_CURRENT_CUDA_ARCH_CUDA_ARCH_SPECIFIC __CUDA_ARCH_SPECIFIC__
 #else
-#define __NVTE_ARCH_SPECIFIC__ constexpr int ArchSpecific = 0;
+#define _NVTE_CURRENT_CUDA_ARCH_CUDA_ARCH_SPECIFIC 0
 #endif
-
 #ifdef __CUDA_ARCH_FAMILY_SPECIFIC__
-#define __NVTE_ARCH_FAMILY_SPECIFIC__ constexpr int FamilySpecific = __CUDA_ARCH_FAMILY_SPECIFIC__;
+#define _NVTE_CURRENT_CUDA_ARCH_CUDA_ARCH_FAMILY_SPECIFIC __CUDA_ARCH_FAMILY_SPECIFIC__
 #else
-#define __NVTE_ARCH_FAMILY_SPECIFIC__ constexpr int FamilySpecific = 0;
+#define _NVTE_CURRENT_CUDA_ARCH_CUDA_ARCH_FAMILY_SPECIFIC 0
 #endif
 
-#define ARCH_SPECIFIC(...)                                                                   \
-  [&] {                                                                                      \
-    __NVTE_CURRENT_ARCH__                                                                    \
-    __NVTE_ARCH_SPECIFIC__                                                                   \
-    __NVTE_ARCH_FAMILY_SPECIFIC__                                                            \
-    return transformer_engine::is_supported_arch<current_arch, ArchSpecific, FamilySpecific, \
-                                                 __VA_ARGS__>();                             \
-  }();
+// Macro to get currently active CUDA arch
+#define NVTE_CURRENT_CUDA_ARCH                              \
+  ::transformer_engine::cuda_arch::details::_CurrentArch<   \
+    _NVTE_CURRENT_CUDA_ARCH_CUDA_ARCH,                      \
+    _NVTE_CURRENT_CUDA_ARCH_CUDA_ARCH_SPECIFIC,             \
+    _NVTE_CURRENT_CUDA_ARCH_CUDA_ARCH_FAMILY_SPECIFIC>
 
-#define ARCH_BLACKWELL_FAMILY ARCH_SPECIFIC(Family<100>, Family<110>, Family<120>)
-#define ARCH_HAS_STOCHASTIC_ROUNDING ARCH_SPECIFIC(Arch<100>, Arch<103>)
+// Macros for CUDA features
+// TODO(tmoon): Use template metaprogramming instead of macros
+#define NVTE_CUDA_ARCHS_IN_BLACKWELL_FAMILY \
+  cuda_arch::ArchFamily<100>, cuda_arch::ArchFamily<110>, cuda_arch::ArchFamily<120>
+#define NVTE_CUDA_ARCHS_WITH_STOCHASTIC_ROUNDING \
+  cuda_arch::ArchSpecific<100>, cuda_arch::ArchSpecific<103>
+
+}  // namespace cuda_arch
 
 namespace ptx {
 
@@ -249,8 +277,8 @@ __device__ __forceinline__ float exp2f(e8m0_t biased_exp) {
 }
 
 __device__ __forceinline__ e8m0_t float_to_e8m0(float val) {
-  constexpr bool is_blackwell = ARCH_BLACKWELL_FAMILY;
-  if constexpr (is_blackwell) {
+  using CurrentCUDAArch = NVTE_CURRENT_CUDA_ARCH;
+  if constexpr (CurrentCUDAArch::any_compatible<NVTE_CUDA_ARCHS_IN_BLACKWELL_FAMILY>()) {
     uint16_t out;
     asm volatile(
         "{\n"
