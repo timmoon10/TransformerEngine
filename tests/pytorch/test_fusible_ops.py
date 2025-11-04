@@ -23,6 +23,7 @@ from transformer_engine.pytorch.ops.fused import (
     BackwardLinearScale,
     ForwardLinearBiasActivation,
     ForwardLinearBiasAdd,
+    ForwardLinearSwiGLU,
     ForwardLinearScaleAdd,
 )
 from transformer_engine.pytorch import (
@@ -2616,6 +2617,104 @@ class TestFusedOps:
         backward_ops = model._module_groups[0]._backward_ops
         assert len(backward_ops) == 1
         assert isinstance(backward_ops[0][0], BackwardLinearScale)
+
+        # Expected numerical error
+        tols = dtype_tols(dtype)
+        if dtype == torch.float32:
+            tols = dtype_tols(torch.float16)  # TF32 GEMM
+        if quantized_compute:
+            tols = quantization_tols(quantization)
+
+        # Check results
+        y_test = y_test.to(dtype=torch.float64, device="cpu")
+        dx_test = x_test.grad.to(dtype=torch.float64, device="cpu")
+        dw_test = model[0].weight.grad.to(dtype=torch.float64, device="cpu")
+        torch.testing.assert_close(y_test, y_ref, **tols)
+        torch.testing.assert_close(dx_test, x_ref.grad, **tols)
+        torch.testing.assert_close(dw_test, w_ref.grad, **tols)
+
+    @pytest.mark.parametrize("dtype", _dtypes)
+    def test_forward_linear_swiglu(
+        self,
+        *,
+        weight_shape: tuple[int, int] = (128, 32),
+        in_shape: Iterable[int] = (32, -1),
+        dtype: torch.dtype,
+        device: torch.device = "cuda",
+        quantization: Optional[str] = None,
+        quantized_weight: bool = False,
+    ) -> None:
+        """Forward GEMM + SwiGLU"""
+
+        # Make input and weight shapes consistent
+        out_features, in_features = weight_shape
+        in_shape = list(in_shape)[:-1] + [in_features]
+        out_shape = in_shape[:-1] + [out_features // 2]
+
+        # Skip invalid configurations
+        quantized_compute = quantization is not None
+        if quantized_compute:
+            pytest.skip("GEMM + SwiGLU kernel is not supported with quantized compute")
+        if dtype not in (torch.float16, torch.bfloat16):
+            pytest.skip(
+                "GEMM + SwiGLU fusion is only supported with FP16/BF16"
+            )
+        if not ForwardLinearSwiGLU._is_gemm_swiglu_enabled:
+            pytest.skip(
+                "GEMM + SwiGLU fusion is not supported "
+                "(consider running with NVTE_FUSED_GEMM_SWIGLU=1)"
+            )
+
+        # Random data
+        x_ref, x_test = make_reference_and_test_tensors(
+            in_shape,
+            quantization=quantization,
+            test_dtype=dtype,
+            test_device=device,
+        )
+        w_ref, w_test = make_reference_and_test_tensors(
+            (out_features, in_features),
+            quantization=quantization,
+            test_dtype=dtype,
+            test_device=device,
+        )
+        dy_ref, dy_test = make_reference_and_test_tensors(
+            out_shape,
+            quantization=quantization,
+            test_dtype=dtype,
+            test_device=device,
+            requires_grad=False,
+        )
+
+        # Plain PyTorch implementation
+        x1, x2 = torch.nn.functional.linear(x_ref, w_ref).chunk(2, dim=-1)
+        y_ref = torch.nn.functional.silu(x1) * x2
+        y_ref.backward(dy_ref)
+
+        # Implementation with fusible operations
+        recipe = make_recipe(quantization)
+        with te.quantized_model_init(enabled=quantized_weight, recipe=recipe):
+            model = te_ops.Sequential(
+                te_ops.Linear(
+                    in_features,
+                    out_features,
+                    bias=False,
+                    device=device,
+                    dtype=dtype,
+                ),
+                te_ops.SwiGLU(),
+            )
+        with torch.no_grad():
+            model[0].weight.copy_(w_test)
+            del w_test
+        with te.autocast(enabled=quantized_compute, recipe=recipe):
+            y_test = model(x_test)
+        y_test.backward(dy_test)
+
+        # Check that forward operations have been fused
+        forward_ops = model._module_groups[0]._forward_ops
+        assert len(forward_ops) == 1
+        assert isinstance(forward_ops[0][0], ForwardLinearSwiGLU)
 
         # Expected numerical error
         tols = dtype_tols(dtype)

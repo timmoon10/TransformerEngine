@@ -32,6 +32,10 @@ from .forward_linear_scale_add import (
     ForwardLinearScaleAdd,
     fuse_forward_linear_scale_add,
 )
+from .forward_linear_swiglu import (
+    ForwardLinearSwiGLU,
+    fuse_forward_linear_swiglu,
+)
 from .userbuffers_backward_linear import (
     UserbuffersBackwardLinear,
     fuse_userbuffers_backward_linear,

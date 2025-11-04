@@ -25,6 +25,7 @@ from transformer_engine.pytorch.ops.fused import (
     fuse_forward_linear_bias_activation,
     fuse_forward_linear_bias_add,
     fuse_forward_linear_scale_add,
+    fuse_forward_linear_swiglu,
     fuse_userbuffers_backward_linear,
     fuse_userbuffers_forward_linear,
 )
@@ -359,6 +360,7 @@ class OperationFuser:
         ops = fuse_forward_linear_bias_add(ops)
         ops = fuse_forward_linear_bias_activation(ops)
         ops = fuse_forward_linear_scale_add(ops)
+        ops = fuse_forward_linear_swiglu(ops, recipe)
         return ops
 
     @classmethod
