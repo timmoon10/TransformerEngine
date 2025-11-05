@@ -2637,8 +2637,8 @@ class TestFusedOps:
     def test_forward_linear_swiglu(
         self,
         *,
-        weight_shape: tuple[int, int] = (128, 32),
-        in_shape: Iterable[int] = (32, -1),
+        weight_shape: tuple[int, int] = (256, 256),
+        in_shape: Iterable[int] = (256, -1),
         dtype: torch.dtype,
         device: torch.device = "cuda",
         quantization: Optional[str] = None,

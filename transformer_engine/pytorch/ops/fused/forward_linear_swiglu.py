@@ -95,8 +95,8 @@ class ForwardLinearSwiGLU(FusedOperation):
         if linear_out_size % 64 != 0:
             raise ValueError(f"Invalid weight dims ({tuple(weight.size())})")
         weight = weight.reshape(2, linear_out_size // 64, 32, linear_in_size)
-        weight = weight.transpose(0, 1).contiguous()
-        weight = weight.reshape(1, linear_out_size, linear_in_size).permute(1, 2, 0)
+        weight = weight.flip(0).permute(1, 0, 2, 3).contiguous()
+        weight = weight.view(1, linear_out_size, linear_in_size).permute(1, 2, 0)
 
         # Reshape input tensor
         input_shape = input_.size()
@@ -112,21 +112,21 @@ class ForwardLinearSwiGLU(FusedOperation):
 
         # Launch GEMM + SwiGLU kernel
         linear_out, swiglu_out = _gemm_swiglu_wrapper_sm100(
-            weight.detach(),
             input_.detach(),
-            c_major="m",
+            weight.detach(),
+            c_major="n",
             c_dtype=dtype,
             glu_dtype=dtype,
+            use_2cta_instrs=True,
+            cluster_shape_mn=(2, 2),
         )
 
         # Reorder and reshape linear output tensor
-        linear_out = linear_out.permute(2, 1, 0)
-        linear_out = linear_out.reshape(-1, linear_out_size // 64, 2, 32)
-        linear_out = linear_out.transpose(-3, -2).contiguous()
+        linear_out = linear_out.view(-1, linear_out_size // 64, 2, 32)
+        linear_out = linear_out.permute(0, 2, 1, 3).flip(1).contiguous()
         linear_out = linear_out.reshape(*input_shape[:-1], linear_out_size)
 
         # Reshape SwiGLU output tensor
-        swiglu_out = swiglu_out.permute(2, 1, 0)
         swiglu_out = swiglu_out.reshape(*input_shape[:-1], linear_out_size // 2)
 
         # Save state for backward pass
