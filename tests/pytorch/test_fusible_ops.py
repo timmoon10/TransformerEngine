@@ -2634,6 +2634,7 @@ class TestFusedOps:
         torch.testing.assert_close(dw_test, w_ref.grad, **tols)
 
     @pytest.mark.parametrize("dtype", _dtypes)
+    @pytest.mark.parametrize("quantization", (None, "fp8_delayed_scaling", "fp8_current_scaling"))
     def test_forward_linear_swiglu(
         self,
         *,
@@ -2641,7 +2642,7 @@ class TestFusedOps:
         in_shape: Iterable[int] = (256, -1),
         dtype: torch.dtype,
         device: torch.device = "cuda",
-        quantization: Optional[str] = None,
+        quantization: Optional[str],
         quantized_weight: bool = False,
     ) -> None:
         """Forward GEMM + SwiGLU"""
@@ -2653,8 +2654,7 @@ class TestFusedOps:
 
         # Skip invalid configurations
         quantized_compute = quantization is not None
-        if quantized_compute:
-            pytest.skip("GEMM + SwiGLU kernel is not supported with quantized compute")
+        maybe_skip_quantization(quantization, dims=in_shape, device=device, dtype=dtype)
         if dtype not in (torch.float16, torch.bfloat16):
             pytest.skip(
                 "GEMM + SwiGLU fusion is only supported with FP16/BF16"

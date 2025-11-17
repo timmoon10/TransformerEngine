@@ -11,9 +11,11 @@ from typing import Any, Optional
 
 import torch
 
+import transformer_engine_torch as tex
 from ...cpu_offload import is_cpu_offload_enabled, mark_activation_offload
 from ...quantization import FP8GlobalStateManager
-from ...tensor import Quantizer
+from ...tensor import Quantizer, QuantizedTensorStorage
+from ...tensor.storage.float8_tensor_storage import Float8TensorStorage
 from ..basic import BasicLinear, SwiGLU
 from ..op import FusedOperation, FusibleOperation, OperationContext
 from .._common import maybe_dequantize
@@ -75,30 +77,18 @@ class ForwardLinearSwiGLU(FusedOperation):
         grad_output_quantizer = linear_op.get_quantizer("backward", 0)
         grad_input_quantizer = prev_op_grad_output_quantizer
         with_quantized_compute = FP8GlobalStateManager.is_fp8_enabled()
-        if with_quantized_compute:
-            raise NotImplementedError("ForwardLinearSwiGLU op does not support quantized compute")
 
-        # Get autocast dtype if needed
+        # Output dtype
         if torch.is_autocast_enabled():
             dtype = torch.get_autocast_dtype("cuda")
         else:
             dtype = linear_op.weight.dtype
 
-        # Tensor parallelism
-        if linear_op.tensor_parallel_mode is not None:
-            raise NotImplementedError("ForwardLinearSwiGLU op does not support tensor parallelism")
-
-        # Reorder and reshape weight tensor
-        weight = maybe_dequantize(linear_op.weight, dtype)
-        weight_saved = weight
+        # Tensor dims
+        weight = linear_op.weight
         linear_out_size, linear_in_size = weight.size()
         if linear_out_size % 64 != 0:
             raise ValueError(f"Invalid weight dims ({tuple(weight.size())})")
-        weight = weight.reshape(2, linear_out_size // 64, 32, linear_in_size)
-        weight = weight.flip(0).permute(1, 0, 2, 3).contiguous()
-        weight = weight.view(1, linear_out_size, linear_in_size).permute(1, 2, 0)
-
-        # Reshape input tensor
         input_shape = input_.size()
         if input_shape[-1] != linear_in_size:
             raise ValueError(
@@ -106,20 +96,93 @@ class ForwardLinearSwiGLU(FusedOperation):
                 f"(input shape is {tuple(input_shape)}), "
                 f"weight shape is {tuple(weight.size())}"
             )
-        input_ = maybe_dequantize(input_.contiguous(), dtype)
-        input_saved = input_
-        input_ = input_.reshape(1, -1, linear_in_size).permute(1, 2, 0)
+
+        # Tensor parallelism
+        if linear_op.tensor_parallel_mode is not None:
+            raise NotImplementedError("ForwardLinearSwiGLU op does not support tensor parallelism")
 
         # Launch GEMM + SwiGLU kernel
-        linear_out, swiglu_out = _gemm_swiglu_wrapper_sm100(
-            input_.detach(),
-            weight.detach(),
-            c_major="n",
-            c_dtype=dtype,
-            glu_dtype=dtype,
-            use_2cta_instrs=True,
-            cluster_shape_mn=(2, 2),
-        )
+        input_saved = None
+        weight_saved = None
+        if with_quantized_compute:
+            # Quantize input and weight tensors if needed
+            if not isinstance(input_, QuantizedTensorStorage):
+                if input_quantizer is None:
+                    raise ValueError("Missing quantizer for input tensor")
+                input_quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
+                input_ = input_quantizer(input_)
+            if not isinstance(input_, Float8TensorStorage):
+                raise ValueError(
+                    "Expected input to be quantized to Float8Tensor, "
+                    f"but got {input_.__class__.__name__}"
+                )
+            if not isinstance(weight, QuantizedTensorStorage):
+                if weight_quantizer is None:
+                    raise ValueError("Missing quantizer for weight tensor")
+                weight_quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
+                weight = weight_quantizer(weight)
+            if not isinstance(weight, Float8TensorStorage):
+                raise ValueError(
+                    "Expected weight to be quantized to Float8Tensor, "
+                    f"but got {weight.__class__.__name__}"
+                )
+            input_saved = input_
+            weight_saved = weight
+
+            # Extract FP8 data
+            ### TODO Avoid GPU sync for alpha
+            input_data = input_._data
+            weight_data = weight._data
+            if input_._fp8_dtype == tex.DType.kFloat8E4M3:
+                input_data = input_data.view(dtype=torch.float8_e4m3fn)
+            elif input_._fp8_dtype == tex.DType.kFloat8E5M2:
+                input_data = input_data.view(dtype=torch.float8_e5m2)
+            if weight._fp8_dtype == tex.DType.kFloat8E4M3:
+                weight_data = weight_data.view(dtype=torch.float8_e4m3fn)
+            elif weight._fp8_dtype == tex.DType.kFloat8E5M2:
+                weight_data = weight_data.view(dtype=torch.float8_e5m2)
+            alpha = (input_._scale_inv * weight._scale_inv).item()
+
+            # Reorder and reshape tensors
+            input_data = input_data.reshape(1, -1, linear_in_size).permute(1, 2, 0)
+            weight_data = weight_data.reshape(2, linear_out_size // 64, 32, linear_in_size)
+            weight_data = weight_data.flip(0).permute(1, 0, 2, 3).contiguous()
+            weight_data = weight_data.view(1, linear_out_size, linear_in_size).permute(1, 2, 0)
+
+            # Launch GEMM + SwiGLU kernel
+            linear_out, swiglu_out = _gemm_swiglu_wrapper_sm100(
+                input_data,
+                weight_data,
+                alpha=alpha,
+                c_major="n",
+                c_dtype=dtype,
+                glu_dtype=dtype,
+                use_2cta_instrs=True,
+                cluster_shape_mn=(2, 2),
+            )
+        else:
+            # Make sure tensors have expected dtype
+            input_ = maybe_dequantize(input_.contiguous(), dtype)
+            weight = maybe_dequantize(weight.contiguous(), dtype)
+            input_saved = input_
+            weight_saved = weight
+
+            # Reorder and reshape tensors
+            input_ = input_.reshape(1, -1, linear_in_size).permute(1, 2, 0)
+            weight = weight.reshape(2, linear_out_size // 64, 32, linear_in_size)
+            weight = weight.flip(0).permute(1, 0, 2, 3).contiguous()
+            weight = weight.view(1, linear_out_size, linear_in_size).permute(1, 2, 0)
+
+            # Launch GEMM + SwiGLU kernel
+            linear_out, swiglu_out = _gemm_swiglu_wrapper_sm100(
+                input_.detach(),
+                weight.detach(),
+                c_major="n",
+                c_dtype=dtype,
+                glu_dtype=dtype,
+                use_2cta_instrs=True,
+                cluster_shape_mn=(2, 2),
+            )
 
         # Reorder and reshape linear output tensor
         linear_out = linear_out.view(-1, linear_out_size // 64, 2, 32)
@@ -128,6 +191,11 @@ class ForwardLinearSwiGLU(FusedOperation):
 
         # Reshape SwiGLU output tensor
         swiglu_out = swiglu_out.reshape(*input_shape[:-1], linear_out_size // 2)
+
+        # Prepare input tensor for backward pass
+        if weight_requires_grad:
+            if with_quantized_compute and isinstance(input_saved, QuantizedTensorStorage):
+                input_saved.update_usage(rowwise_usage=False, columnwise_usage=True)
 
         # Save state for backward pass
         if linear_op_ctx.requires_grad:
@@ -171,7 +239,9 @@ def fuse_forward_linear_swiglu(
     # Check if fused kernel is available for recipe
     if not ForwardLinearSwiGLU._is_gemm_swiglu_enabled:
         return ops
-    if recipe is not None:
+    if recipe is None or recipe.delayed() or recipe.float8_current_scaling():
+        pass
+    else:
         return ops
 
     # Scan through ops, fusing if possible
