@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch.nn import Parameter
 
 import transformer_engine.pytorch as te
+import transformer_engine.pytorch.functional as te_functional
 from transformer_engine.common import recipe
 from transformer_engine.pytorch import (
     Float8Quantizer,
@@ -137,6 +138,50 @@ def dtype_tols(dtype: torch.dtype) -> Dict[str, float]:
     if dtype == torch.bfloat16:
         return dict(rtol=1.6e-2, atol=1e-5)
     raise ValueError(f"Unsupported dtype ({dtype})")
+
+
+def test_functional_grouped_linear_matches_torch_split_path():
+    """Functional grouped linear matches a loop of torch linear calls."""
+
+    dtype = torch.float16
+    device = "cuda"
+    split_sizes = torch.tensor([3, 5, 2], dtype=torch.int64, device=device)
+    in_features = 16
+    out_features = 12
+    total_tokens = int(split_sizes.sum().item())
+
+    torch.manual_seed(seed)
+    x = torch.randn(total_tokens, in_features, dtype=dtype, device=device)
+    weights = [
+        torch.randn(out_features, in_features, dtype=dtype, device=device)
+        for _ in range(split_sizes.numel())
+    ]
+    biases = [
+        torch.randn(out_features, dtype=dtype, device=device) for _ in range(split_sizes.numel())
+    ]
+
+    out, cache = te_functional.grouped_linear(
+        x,
+        weights,
+        split_sizes,
+        bias=biases,
+        dtype=dtype,
+        use_grouped_tensor_path=False,
+        return_cache=True,
+    )
+
+    expected = torch.cat(
+        [
+            torch.nn.functional.linear(x_i, weight, bias)
+            for x_i, weight, bias in zip(torch.split(x, split_sizes.tolist()), weights, biases)
+        ],
+        dim=0,
+    )
+    torch.testing.assert_close(out.float(), expected.float(), **dtype_tols(dtype))
+    assert isinstance(cache, dict)
+    assert cache["path"] == "split"
+    assert cache["num_groups"] == split_sizes.numel()
+    assert "saved_tensors" in cache
 
 
 param_types = [torch.float32, torch.float16]
