@@ -46,10 +46,9 @@ from ..distributed import (
 )
 from ..cpp_extensions import (
     general_grouped_gemm,
-    general_grouped_gemm_for_grouped_tensor,
 )
 from .._functional.grouped_linear import (
-    compute_grouped_linear_dbias,
+    grouped_linear_backward_grouped_tensor,
     grouped_linear_forward_grouped_tensor,
     grouped_tensor_path_is_supported,
     make_grouped_bias,
@@ -61,7 +60,7 @@ from ..constants import GemmParallelModes, dist_group_type
 from ..jit import no_torch_dynamo
 from ..cpu_offload import is_cpu_offload_enabled, mark_not_offload, start_offload
 
-from ..tensor import Float8CurrentScalingQuantizer, Float8Quantizer, MXFP8Quantizer
+from ..tensor import Float8CurrentScalingQuantizer, Float8Quantizer
 from ..quantized_tensor import (
     QuantizedTensorStorage,
     Quantizer,
@@ -669,83 +668,6 @@ class _GroupedLinear(torch.autograd.Function):
                 if main_grad is not None:
                     origin_weight.main_grad = main_grad
 
-        grad_output_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
-        dy_2d = cast_if_needed(grad_output_view, ctx.activation_dtype)
-        dbias_packed = None
-        if ctx.fp8:
-            grad_output_quantizer = ctx.grad_output_quantizers[0]
-            grad_output_quantizer.set_usage(
-                rowwise=ctx.requires_dgrad,
-                columnwise=ctx.weights_requires_grad,
-            )
-            grad_output_quantizer.optimize_for_gemm = True
-            if ctx.use_bias and isinstance(grad_output_quantizer, MXFP8Quantizer):
-                grouped_dy, dbias_packed = tex.bgrad_group_quantize(
-                    dy_2d,
-                    grad_output_quantizer,
-                    N,
-                    split_sizes,
-                )
-            else:
-                grouped_dy = tex.group_quantize(
-                    dy_2d,
-                    grad_output_quantizer,
-                    N,
-                    split_sizes,
-                )
-        else:
-            grouped_dy = _GroupedLinear._make_grouped_tensor(
-                dy_2d,
-                num_gemms=N,
-                split_sizes=split_sizes,
-                base_split_offsets=base_split_offsets,
-                last_dim=ctx.weights_shape_0,
-                dtype=ctx.activation_dtype,
-            )
-
-        grad_biases = [None] * N
-        if ctx.use_bias:
-            if dbias_packed is None:
-                grad_biases, _, dbias_packed = compute_grouped_linear_dbias(
-                    dy_2d,
-                    base_split_offsets,
-                    num_groups=N,
-                    dtype=ctx.activation_dtype,
-                )
-            else:
-                grad_biases = [dbias_packed[i].to(dtype=ctx.activation_dtype) for i in range(N)]
-
-        dgrad = None
-        if ctx.requires_dgrad:
-            dgrad_gemm_use_split_accumulator = _2X_ACC_DGRAD
-            if ctx.fp8:
-                recipe = ctx.fp8_recipe
-                if hasattr(recipe, "fp8_gemm_dgrad"):
-                    dgrad_gemm_use_split_accumulator = recipe.fp8_gemm_dgrad.use_split_accumulator
-            for weight in weights:
-                if isinstance(weight, QuantizedTensorStorage):
-                    weight.update_usage(columnwise_usage=True)
-            dgrad = torch.empty(
-                (dy_2d.size(0), ctx.weights_shape_1),
-                dtype=ctx.activation_dtype,
-                device=ctx.device,
-            )
-            grouped_dgrad = _GroupedLinear._make_grouped_tensor(
-                dgrad,
-                num_gemms=N,
-                split_sizes=split_sizes,
-                base_split_offsets=base_split_offsets,
-                last_dim=ctx.weights_shape_1,
-                dtype=ctx.activation_dtype,
-            )
-            general_grouped_gemm_for_grouped_tensor(
-                weights,
-                grouped_dy,
-                grouped_dgrad,
-                layout="NN",
-                use_split_accumulator=dgrad_gemm_use_split_accumulator,
-            )
-
         if ctx.is_first_microbatch is not None:
             accumulate_wgrad_into_param_main_grad = (
                 ctx.fuse_wgrad_accumulation and not ctx.is_first_microbatch
@@ -753,12 +675,20 @@ class _GroupedLinear(torch.autograd.Function):
         else:
             accumulate_wgrad_into_param_main_grad = ctx.fuse_wgrad_accumulation
 
+        dgrad_gemm_use_split_accumulator = _2X_ACC_DGRAD
+        if ctx.requires_dgrad and ctx.fp8:
+            recipe = ctx.fp8_recipe
+            if hasattr(recipe, "fp8_gemm_dgrad"):
+                dgrad_gemm_use_split_accumulator = recipe.fp8_gemm_dgrad.use_split_accumulator
+
+        wgrad_gemm_use_split_accumulator = _2X_ACC_WGRAD
+        if ctx.weights_requires_grad and ctx.fp8:
+            recipe = ctx.fp8_recipe
+            if hasattr(recipe, "fp8_gemm_wgrad"):
+                wgrad_gemm_use_split_accumulator = recipe.fp8_gemm_wgrad.use_split_accumulator
+
+        wgrad_list = [None] * N
         if ctx.weights_requires_grad:
-            wgrad_gemm_use_split_accumulator = _2X_ACC_WGRAD
-            if ctx.fp8:
-                recipe = ctx.fp8_recipe
-                if hasattr(recipe, "fp8_gemm_wgrad"):
-                    wgrad_gemm_use_split_accumulator = recipe.fp8_gemm_wgrad.use_split_accumulator
             if ctx.fuse_wgrad_accumulation:
                 wgrad_list = main_grads
             else:
@@ -776,22 +706,6 @@ class _GroupedLinear(torch.autograd.Function):
                 if not getattr(ctx, "origin_weights_overwrite_main_grad", False)
                 else False
             )
-
-            def grouped_gemm_wgrad(inputmats, grad_output_mats, grad_weights):
-                general_grouped_gemm_for_grouped_tensor(
-                    inputmats,
-                    grad_output_mats,
-                    grad_weights,
-                    layout="NT",
-                    use_split_accumulator=wgrad_gemm_use_split_accumulator,
-                    accumulate=accumulate,
-                )
-                return None, [None] * N, None
-
-            if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
-                ctx.wgrad_store.put([grouped_x, grouped_dy, wgrad_list], grouped_gemm_wgrad)
-            else:
-                grouped_gemm_wgrad(grouped_x, grouped_dy, wgrad_list)
 
             def handle_custom_ddp_from_mcore(weight, main_grad, wgrad):
                 if ctx.weights_requires_grad:
@@ -814,12 +728,41 @@ class _GroupedLinear(torch.autograd.Function):
                     wgrad = None
                 return wgrad
 
+        else:
+            accumulate = False
+            handle_custom_ddp_from_mcore = None
+
+        backward_result = grouped_linear_backward_grouped_tensor(
+            grad_output,
+            grouped_x,
+            weights,
+            split_sizes,
+            base_split_offsets,
+            num_groups=N,
+            in_features=ctx.weights_shape_1,
+            out_features=ctx.weights_shape_0,
+            dtype=ctx.activation_dtype,
+            device=ctx.device,
+            with_quantized_compute=ctx.fp8,
+            grad_output_quantizers=ctx.grad_output_quantizers,
+            input_requires_grad=ctx.requires_dgrad,
+            weight_requires_grad=ctx.weights_requires_grad,
+            has_bias=ctx.use_bias,
+            wgrad_output=wgrad_list if ctx.weights_requires_grad else None,
+            wgrad_store=ctx.wgrad_store,
+            wgrad_store_return=(None, [None] * N, None),
+            accumulate_wgrad=accumulate,
+            dgrad_use_split_accumulator=dgrad_gemm_use_split_accumulator,
+            wgrad_use_split_accumulator=wgrad_gemm_use_split_accumulator,
+            cast_grad_output_before_quantize=True,
+        )
+        dgrad = backward_result["grad_input"]
+        grad_biases = backward_result["grad_biases"]
+        if ctx.weights_requires_grad:
             wgrad_list = [
                 handle_custom_ddp_from_mcore(weight, main_grad, wgrad)
                 for weight, main_grad, wgrad in zip(origin_weights, main_grads, wgrad_list)
             ]
-        else:
-            wgrad_list = [None] * N
 
         if not ctx.use_bias:
             grad_biases = [None] * N

@@ -21,7 +21,7 @@ import torch
 import transformer_engine_torch as tex
 
 from ..cpp_extensions import general_grouped_gemm, general_grouped_gemm_for_grouped_tensor
-from ..module.base import _2X_ACC_FPROP, quantize_weight
+from ..module.base import _2X_ACC_DGRAD, _2X_ACC_FPROP, _2X_ACC_WGRAD, quantize_weight
 from ..ops._common import is_quantized_tensor, maybe_dequantize
 from ..quantized_tensor import QuantizedTensorStorage
 from ..tensor import Float8CurrentScalingQuantizer, GroupedTensor, GroupedTensorStorage
@@ -576,3 +576,142 @@ def compute_grouped_linear_dbias(
     else:
         dbias_packed = compute_grouped_dbias(grad_output_2d, split_offsets, num_groups)
     return [dbias_packed[idx].to(dtype=dtype) for idx in range(num_groups)], grad_scales, dbias_packed
+
+
+def grouped_linear_backward_grouped_tensor(
+    grad_output: torch.Tensor,
+    grouped_x: Optional[GroupedTensorStorage],
+    weights: Sequence[torch.Tensor | QuantizedTensorStorage] | GroupedTensorStorage,
+    split_sizes: torch.Tensor,
+    base_split_offsets: torch.Tensor,
+    *,
+    num_groups: int,
+    in_features: int,
+    out_features: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    with_quantized_compute: bool,
+    grad_output_quantizers: Sequence[Optional[Quantizer]],
+    input_requires_grad: bool,
+    weight_requires_grad: bool,
+    has_bias: bool,
+    biases: Optional[Sequence[torch.Tensor | QuantizedTensorStorage]] = None,
+    scales: Optional[torch.Tensor] = None,
+    wgrad_output: Optional[Sequence[torch.Tensor] | GroupedTensorStorage] = None,
+    wgrad_store: Optional[Any] = None,
+    wgrad_store_return: Optional[Any] = None,
+    accumulate_wgrad: bool = False,
+    dgrad_use_split_accumulator: bool = _2X_ACC_DGRAD,
+    wgrad_use_split_accumulator: bool = _2X_ACC_WGRAD,
+    cast_grad_output_before_quantize: bool = False,
+) -> dict[str, Any]:
+    """GroupedTensor backward compute for grouped linear.
+
+    Caller owns parameter-order concerns, main-grad/dummy-grad policy, and
+    whether ``wgrad_output`` points at ordinary grad buffers or parameter
+    ``main_grad`` buffers.
+    """
+
+    dy_2d = grad_output.contiguous().view(-1, out_features)
+    if cast_grad_output_before_quantize or not with_quantized_compute:
+        dy_2d = maybe_dequantize_to_dtype(dy_2d, dtype)
+
+    dbias_packed = None
+    if with_quantized_compute:
+        grad_output_quantizer = grad_output_quantizers[0]
+        if grad_output_quantizer is None:
+            raise ValueError("Missing quantizer for grouped-linear grad output")
+        grad_output_quantizer.set_usage(rowwise=input_requires_grad, columnwise=weight_requires_grad)
+        grad_output_quantizer.optimize_for_gemm = True
+        if has_bias and scales is None and isinstance(grad_output_quantizer, MXFP8Quantizer):
+            grouped_dy, dbias_packed = tex.bgrad_group_quantize(
+                dy_2d,
+                grad_output_quantizer,
+                num_groups,
+                split_sizes,
+            )
+        else:
+            grouped_dy = tex.group_quantize(
+                dy_2d,
+                grad_output_quantizer,
+                num_groups,
+                split_sizes,
+            )
+    else:
+        grouped_dy = make_grouped_tensor_from_2d_buffer(
+            dy_2d,
+            num_groups=num_groups,
+            split_sizes=split_sizes,
+            base_split_offsets=base_split_offsets,
+            last_dim=out_features,
+            dtype=dtype,
+        )
+
+    grad_biases = [None] * num_groups
+    grad_scales = None
+    if has_bias:
+        if dbias_packed is None:
+            grad_biases, grad_scales, dbias_packed = compute_grouped_linear_dbias(
+                dy_2d,
+                base_split_offsets,
+                num_groups=num_groups,
+                dtype=dtype,
+                scales=scales,
+                biases=biases,
+            )
+        else:
+            grad_biases = [dbias_packed[idx].to(dtype=dtype) for idx in range(num_groups)]
+
+    grad_input = None
+    if input_requires_grad:
+        weight_iter = weights if isinstance(weights, (list, tuple)) else [weights]
+        for weight in weight_iter:
+            if isinstance(weight, QuantizedTensorStorage):
+                weight.update_usage(columnwise_usage=True)
+        grad_input = torch.empty(
+            (dy_2d.size(0), in_features),
+            dtype=dtype,
+            device=device,
+        )
+        grouped_grad_input = make_grouped_tensor_from_2d_buffer(
+            grad_input,
+            num_groups=num_groups,
+            split_sizes=split_sizes,
+            base_split_offsets=base_split_offsets,
+            last_dim=in_features,
+            dtype=dtype,
+        )
+        general_grouped_gemm_for_grouped_tensor(
+            weights,
+            grouped_dy,
+            grouped_grad_input,
+            layout="NN",
+            use_split_accumulator=dgrad_use_split_accumulator,
+        )
+
+    if weight_requires_grad:
+        if grouped_x is None or wgrad_output is None:
+            raise ValueError("Grouped-linear wgrad requires saved input and output buffers")
+        def wgrad_gemm(inputmats, grad_output_mats, grad_weights):
+            general_grouped_gemm_for_grouped_tensor(
+                inputmats,
+                grad_output_mats,
+                grad_weights,
+                layout="NT",
+                accumulate=accumulate_wgrad,
+                use_split_accumulator=wgrad_use_split_accumulator,
+            )
+            return wgrad_store_return
+
+        if wgrad_store is not None and wgrad_store.delay_wgrad_compute():
+            wgrad_store.put([grouped_x, grouped_dy, wgrad_output], wgrad_gemm)
+        else:
+            wgrad_gemm(grouped_x, grouped_dy, wgrad_output)
+
+    return {
+        "grad_input": grad_input,
+        "grad_biases": grad_biases,
+        "grad_scales": grad_scales,
+        "dbias_packed": dbias_packed,
+        "grouped_dy": grouped_dy,
+    }
