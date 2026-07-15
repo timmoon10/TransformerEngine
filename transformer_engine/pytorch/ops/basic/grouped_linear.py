@@ -19,6 +19,7 @@ from ...cpp_extensions import general_grouped_gemm, general_grouped_gemm_for_gro
 from ..._functional.grouped_linear import (
     compute_grouped_linear_dbias,
     grouped_linear_forward_grouped_tensor,
+    grouped_linear_forward_split,
     grouped_tensor_path_is_supported,
     prepare_grouped_weight_for_grouped_gemm,
 )
@@ -1076,10 +1077,6 @@ class GroupedLinear(BasicOperation):
     ) -> tuple[torch.Tensor, tuple[Optional[torch.Tensor], ...]]:
         """Legacy ``tex.split_quantize`` + ``general_grouped_gemm`` flow."""
         num_groups = self.num_groups
-        has_bias = self.has_bias
-
-        # Need CPU split sizes for split_quantize / general_grouped_gemm.
-        split_sizes_int = [int(s) for s in split_sizes.tolist()]
 
         # Extract params
         if self.single_grouped_weight:
@@ -1088,87 +1085,24 @@ class GroupedLinear(BasicOperation):
                 weights = self.weight.split_into_quantized_tensors()
         else:
             weights = [getattr(self, f"weight{idx}") for idx in range(num_groups)]
-        bs = None
-        if has_bias:
-            bs = self._get_bias_tensors(dtype)
-
-        ws = self._get_discrete_weights_for_gemm(
+        result = grouped_linear_forward_split(
+            input_,
             weights,
-            weight_quantizers,
-            columnwise_usage=input_requires_grad,
+            split_sizes,
+            biases=self._get_bias_tensors(dtype) if self.has_bias else None,
+            scales=scales if self._scale_bias else None,
+            input_quantizers=input_quantizers,
+            weight_quantizers=weight_quantizers,
+            output_quantizers=[None] * num_groups,
             with_quantized_compute=with_quantized_compute,
             dtype=dtype,
+            input_requires_grad=input_requires_grad,
+            weight_requires_grad=weight_requires_grad,
+            cpu_offloading=is_cpu_offload_enabled(),
+            use_quantize_weight=False,
+            optimize_weight_for_gemm=False,
         )
-
-        # Split input tensor and convert dtypes if needed
-        x = maybe_dequantize(input_, dtype)
-        xs = None
-        if with_quantized_compute:
-            for quantizer in input_quantizers:
-                quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
-            xs = tex.split_quantize(x, split_sizes_int, input_quantizers)
-        else:
-            xs = torch.split(x, split_sizes_int)
-        if is_cpu_offload_enabled():
-            live_xs = [t for t in xs if t is not None]
-            if live_xs:
-                start_offload(*live_xs)
-
-        # Allocate output tensor
-        in_shape = list(input_.size())
-        out_shape = in_shape[:-1] + [self.out_features]
-        out = torch.empty(out_shape, dtype=dtype, device=device)
-
-        # Perform GEMMs
-        use_gemm_bias = has_bias and not self._scale_bias
-        general_grouped_gemm(
-            ws,
-            xs,
-            [out],
-            [None] * num_groups,  # quantization_params
-            dtype,
-            m_splits=split_sizes_int,
-            bias=bs if use_gemm_bias else None,
-            use_bias=use_gemm_bias,
-            use_split_accumulator=_2X_ACC_FPROP,
-            single_output=True,
-        )
-
-        # Add bias * scales when scale_bias is enabled
-        if self._scale_bias and has_bias:
-            scales_splits = torch.split(scales, split_sizes_int)
-            out_splits = torch.split(out, split_sizes_int)
-            for i in range(num_groups):
-                out_splits[i].add_(bs[i].unsqueeze(0) * scales_splits[i].unsqueeze(-1))
-
-        # Prepare weight tensors for backward pass
-        if not input_requires_grad:
-            ws = [None] * num_groups
-        elif with_quantized_compute:
-            for w, weight_param in zip(ws, weights):
-                if w is not weight_param:
-                    w.update_usage(rowwise_usage=False, columnwise_usage=True)
-
-        # Prepare input tensor for backward pass
-        if not weight_requires_grad:
-            xs = [None] * num_groups
-        elif with_quantized_compute:
-            for x in xs:
-                x.update_usage(rowwise_usage=False, columnwise_usage=True)
-
-        # Build the tuple of tensors to save for backward. Layout:
-        #   [split_sizes, base_split_offsets, split_points,
-        #    (scales if scale_bias), *xs, *ws]
-        # ``base_split_offsets`` and ``split_points`` are unused on the
-        # split-quantize backward path but are included as ``None`` so the
-        # saved-tensor layout matches the graph-safe
-        # ``_fuser_forward_grouped_tensor`` path (and the fused MLP forward).
-        saved: list[Optional[torch.Tensor]] = [split_sizes, None, None]
-        if self._scale_bias:
-            saved.append(scales)
-        saved.extend(xs)
-        saved.extend(ws)
-        return out, tuple(saved)
+        return result.output, result.cache["saved_tensors"]
 
     def _fuser_forward_grouped_tensor(
         self,

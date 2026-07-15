@@ -204,7 +204,7 @@ def prepare_discrete_weights_for_grouped_gemm(
     out: list[torch.Tensor | QuantizedTensorStorage] = []
     update_ws = is_first_microbatch is None or is_first_microbatch
     for idx, weight in enumerate(weights):
-        if is_quantized_tensor(weight):
+        if is_quantized_tensor(weight) and not use_quantize_weight:
             out.append(weight)
             continue
         quantizer = weight_quantizers[idx]
@@ -299,6 +299,7 @@ def grouped_linear_forward_grouped_tensor(
     skip_fp8_weight_update: Optional[torch.Tensor] = None,
     use_quantize_weight: bool = True,
     optimize_weight_for_gemm: bool = True,
+    fprop_use_split_accumulator: bool = _2X_ACC_FPROP,
 ) -> GroupedLinearForwardResult:
     """Graph-safe grouped-linear forward using GroupedTensor metadata."""
 
@@ -392,7 +393,7 @@ def grouped_linear_forward_grouped_tensor(
         layout="TN",
         bias=grouped_bias,
         bias_scale=bias_scale,
-        use_split_accumulator=_2X_ACC_FPROP,
+        use_split_accumulator=fprop_use_split_accumulator,
     )
 
     if not input_requires_grad:
@@ -450,6 +451,7 @@ def grouped_linear_forward_split(
     cpu_offloading: bool = False,
     use_quantize_weight: bool = True,
     optimize_weight_for_gemm: bool = True,
+    fprop_use_split_accumulator: bool = _2X_ACC_FPROP,
 ) -> GroupedLinearForwardResult:
     """Legacy grouped-linear forward using split tensors and grouped GEMM."""
 
@@ -503,7 +505,7 @@ def grouped_linear_forward_split(
         m_splits=split_sizes_int,
         bias=bs if use_gemm_bias else None,
         use_bias=use_gemm_bias,
-        use_split_accumulator=_2X_ACC_FPROP,
+        use_split_accumulator=fprop_use_split_accumulator,
     )
 
     if scales is not None and bs is not None:
