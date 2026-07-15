@@ -66,6 +66,7 @@ from transformer_engine.pytorch.cpu_offload import (
     mark_not_offload,
     ManualOffloadSynchronizer,
 )
+from transformer_engine.pytorch import functional
 from transformer_engine.pytorch import ops
 from transformer_engine.pytorch import optimizers
 from transformer_engine.pytorch.export import onnx_export
