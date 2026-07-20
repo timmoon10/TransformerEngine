@@ -1028,6 +1028,7 @@ class GroupedLinear(BasicOperation):
             weight_quantizers=weight_quantizers,
             input_requires_grad=input_requires_grad,
             weight_requires_grad=weight_requires_grad,
+            grouped_gemm_backend="try_grouped_tensor",
             with_cpu_offload=is_cpu_offload_enabled(),
         )
 
@@ -1036,7 +1037,7 @@ class GroupedLinear(BasicOperation):
             ### TODO Implement
             raise NotImplementedError
         else:
-            tensors_to_save = [split_sizes, None, None]
+            tensors_to_save = [saved["split_sizes"], None, None]
             if self._scale_bias:
                 tensors_to_save.append(saved["bias_scales"])
             tensors_to_save.extend(saved["inputs"])

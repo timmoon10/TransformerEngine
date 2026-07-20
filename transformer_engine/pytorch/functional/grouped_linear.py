@@ -7,13 +7,14 @@
 from __future__ import annotations
 from collections.abc import Sequence
 import functools
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import torch
 
 import transformer_engine_torch as tex
 from transformer_engine.common.recipe import Recipe
 from ..cpp_extensions import general_grouped_gemm
+from ..cpu_offload import mark_activation_offload, start_offload
 from ..tensor import (
     GroupedTensor,
     GroupedTensorStorage,
@@ -40,20 +41,32 @@ def _is_grouped_tensor_path_supported(
     input_quantizers: Optional[Sequence[Quantizer]],
     weight_quantizers: Optional[Sequence[Quantizer]],
     dtype: torch.dtype,
-    with_single_grouped_weight: bool
+    with_single_grouped_weight: bool,
+    throw_if_unsupported: bool,
 ) -> bool:
 
     ### TODO Remove
     return False
 
-    # Graph-safe grouped GEMM is supported on Hopper and Blackwell (SM 10.x, 11.0)
+    def maybe_throw(message: str) -> Literal[False]:
+        """Throw if needed, otherwise return False."""
+        if throw_if_unsupported:
+            raise RuntimeError(message)
+        return False
+
+    # Grouped tensor implementation is supported on Hopper and Blackwell (SM 10.x, 11.0)
     device_arch = get_device_compute_capability()
     if not (9, 0) <= device_arch <= (11, 0):
-        return False
+        return maybe_throw(
+            "Grouped GEMM is supported on device arch 9.x, 10.x, 10.0, "
+            f"but found {'.'.join(str(v) for v in device_arch)}."
+        )
 
     # cuBLAS only supports BF16/FP16 output
     if dtype not in (torch.bfloat16, torch.float16):
-        return False
+        return maybe_throw(
+            f"Grouped GEMM is supported with BF16/FP16 output, but found dtype={dtype}"
+        )
 
     # Unquantized compute
     if not with_quantized_compute:
@@ -71,29 +84,36 @@ def _is_grouped_tensor_path_supported(
     # FP8 current scaling
     if all(isinstance(q, Float8CurrentScalingQuantizer) for q in quantizers):
         if device_arch < (10, 0) and tex.get_cublasLt_version() < 130500:
-            # cuBLAS 13.5 added Hopper support for FP8 grouped GEMM
-            return False
+            return maybe_throw(
+                "cuBLAS 13.5+ is required for FP8 grouped GEMM on Hopper, "
+                f"but found cuBLAS version {tex.get_cublasLt_version()}."
+            )
         return True
 
     # MXFP8
     if all(isinstance(q, MXFP8Quantizer) for q in quantizers):
         if device_arch < (10, 0):
-            # MXFP8 requires Blackwell+
-            return False
+            return maybe_throw(
+                "MXFP8 requires Blackwell or newer, "
+                f"but found device arch {'.'.join(str(v) for v in device_arch)}."
+            )
         return True
 
     # NVFP4
     if all(isinstance(q, NVFP4) for q in quantizers):
         if device_arch < (10, 0):
-            # NVFP4 requires Blackwell+
-            return False
-        if input_quantizer.with_rht and not with_single_grouped_weight:
-            # cuBLAS supports NVFP4 with RHT and discrete weights
-            return True
-        return False
+            return maybe_throw(
+                "NVFP4 requires Blackwell or newer, "
+                f"but found device arch {'.'.join(str(v) for v in device_arch)}."
+            )
+        if not input_quantizer.with_rht:
+            return maybe_throw("NVFP4 group quantize is only supported with RHT.")
+        if with_single_grouped_weight:
+            return maybe_throw("NVFP4 grouped GEMM is only supported with discrete weights.")
+        return True
 
     # Unsupported case
-    return False
+    return maybe_throw("Quantization recipe does not support grouped GEMM.")
 
 @functools.lru_cache
 def _use_split_accumulator_default(gemm_type: str) -> bool:
@@ -148,8 +168,9 @@ def _grouped_linear_forward_with_split_quantize(
     with_quantized_compute = quantization_recipe is not None
 
     # Move split sizes to CPU for split-quantize
-    split_sizes = [int(s) for s in split_sizes.tolist()]
-    num_groups = len(split_sizes)
+    split_sizes = split_sizes.to(device="cpu")
+    split_sizes_list = [int(s) for s in split_sizes.tolist()]
+    num_groups = len(split_sizes_list)
 
     # Get discrete weight tensors
     if isinstance(weights, GroupedTensorStorage):
@@ -177,11 +198,11 @@ def _grouped_linear_forward_with_split_quantize(
     if with_quantized_compute:
         for quantizer in input_quantizers:
             quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
-        xs = tex.split_quantize(x, split_sizes, input_quantizers)
+        xs = tex.split_quantize(x, split_sizes_list, input_quantizers)
     else:
-        xs = torch.split(x, split_sizes)
+        xs = torch.split(x, split_sizes_list)
 
-    # Start CPU offloading for inputs, if enabled
+    # Activation CPU offloading
     if with_cpu_offload:
         start_offload(*xs)
 
@@ -207,7 +228,7 @@ def _grouped_linear_forward_with_split_quantize(
         [out],
         [None] * num_groups,  # quantization_params
         dtype,
-        m_splits=split_sizes,
+        m_splits=split_sizes_list,
         bias=biases if with_fused_gemm_bias else None,
         use_bias=with_fused_gemm_bias,
         use_split_accumulator=use_split_accumulator,
@@ -216,8 +237,8 @@ def _grouped_linear_forward_with_split_quantize(
 
     # Apply scaled bias if needed
     if biases is not None and not with_fused_gemm_bias:
-        bias_scales_splits = torch.split(bias_scales, split_sizes)
-        out_splits = torch.split(out, split_sizes)
+        bias_scales_splits = torch.split(bias_scales, split_sizes_list)
+        out_splits = torch.split(out, split_sizes_list)
         for i in range(num_groups):
             b = biases[i].unsqueeze(0)
             s = bias_scales_splits[i].unsqueeze(-1)
@@ -238,11 +259,17 @@ def _grouped_linear_forward_with_split_quantize(
         for x in xs:
             x.update_usage(rowwise_usage=False, columnwise_usage=True)
 
+    # Activation CPU offloading
+    if with_cpu_offload:
+        mark_activation_offload(*xs)
+        mark_not_offload(split_sizes, *ws)
+
     # Saved state for backward pass
     saved = {
         "use_grouped_tensor_path": False,
         "inputs": xs,
         "weights": ws,
+        "split_sizes": split_sizes,
         "bias_scales": bias_scales,
     }
 
@@ -263,6 +290,7 @@ def grouped_linear_forward(
     weight_quantizers: Optional[Sequence[Quantizer]] = None,
     input_requires_grad: bool = True,
     weight_requires_grad: bool = True,
+    grouped_gemm_backend: str = "split_tensors",
     with_cpu_offload: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
@@ -304,18 +332,20 @@ def grouped_linear_forward(
         raise ValueError(f"Output tensor has invalid dtype (expected {dtype}, got {out.dtype})")
 
     # Use grouped tensor impl if supported
-    use_grouped_tensor_path = _is_grouped_tensor_path_supported(
-        with_quantized_compute=with_quantized_compute,
-        input_quantizers=input_quantizers,
-        weight_quantizers=weight_quantizers,
-        dtype=dtype,
-        with_single_grouped_weight=isinstance(weights, GroupedTensorStorage),
-    )
-    if use_grouped_tensor_path:
-        ### TODO Implement
-        return _grouped_linear_forward_with_grouped_tensor(
-            ...
+    if grouped_gemm_backend in ("grouped_tensor", "prefer_grouped_tensor"):
+        is_grouped_tensor_path_supported = _is_grouped_tensor_path_supported(
+            with_quantized_compute=with_quantized_compute,
+            input_quantizers=input_quantizers,
+            weight_quantizers=weight_quantizers,
+            dtype=dtype,
+            with_single_grouped_weight=isinstance(weights, GroupedTensorStorage),
+            throw_if_unsupported=grouped_gemm_backend == "grouped_tensor",
         )
+        if is_grouped_tensor_path_supported:
+            ### TODO Implement
+            return _grouped_linear_forward_with_grouped_tensor(
+                ...
+            )
 
     # Split-quantize impl
     return _grouped_linear_forward_with_split_quantize(
