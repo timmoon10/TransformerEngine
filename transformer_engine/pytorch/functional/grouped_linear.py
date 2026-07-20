@@ -6,17 +6,19 @@
 
 from __future__ import annotations
 from collections.abc import Sequence
+import functools
 from typing import Any, Optional
 
 import torch
 
 import transformer_engine_torch as tex
-from ...module.base import (
-    _2X_ACC_FPROP,
-    _2X_ACC_DGRAD,
-    _2X_ACC_WGRAD,
+from transformer_engine.common.recipe import Recipe
+from ..cpp_extensions import general_grouped_gemm
+from ..tensor import (
+    GroupedTensor,
+    GroupedTensorStorage,
+    QuantizedTensorStorage,
 )
-from ...tensor import GroupedTensor, GroupedTensorStorage
 
 
 def _to_dequantized(
@@ -24,7 +26,7 @@ def _to_dequantized(
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Dequantize tensor to given dtype or just convert if not a quantized tensor"""
-    if is_quantized_tensor(tensor):
+    if isinstance(tensor, QuantizedTensorStorage):
         return tensor.dequantize(dtype=dtype)
     if dtype is not None and tensor.dtype != dtype:
         tensor = tensor.to(dtype)
@@ -93,6 +95,32 @@ def _is_grouped_tensor_path_supported(
     # Unsupported case
     return False
 
+@functools.lru_cache
+def _use_split_accumulator_default(gemm_type: str) -> bool:
+    from ..module.base import _2X_ACC_FPROP, _2X_ACC_DGRAD, _2X_ACC_WGRAD
+
+    if gemm_type == "fprop":
+        return _2X_ACC_FPROP
+    if gemm_type == "dgrad":
+        return _2X_ACC_DGRAD
+    if gemm_type == "wgrad":
+        return _2X_ACC_WGRAD
+    raise ValueError(f"Unrecognized GEMM type ({gemm_type})")
+
+def _use_split_accumulator(gemm_type: str, recipe: Optional[Recipe]) -> bool:
+
+    if gemm_type not in ("fprop", "dgrad", "wgrad"):
+        raise ValueError(f"Unrecognized GEMM type ({gemm_type})")
+
+    # Check if use_split_accumulator is configured in recipe
+    if recipe is not None:
+        matmul_params = getattr(recipe, f"fp8_gemm_{gemm_type}", None)
+        if matmul_params is not None:
+            return matmul_params.use_split_accumulator
+
+    # Return default config
+    return _use_split_accumulator_default(gemm_type)
+
 def _grouped_linear_forward_with_grouped_tensor(
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     ### TODO Implement
@@ -108,7 +136,7 @@ def _grouped_linear_forward_with_split_quantize(
     device: torch.device,
     dtype: torch.dtype,
     out: Optional[torch.Tensor],
-    with_quantized_compute: bool,
+    quantization_recipe: Optional[Recipe] = None,
     input_quantizers: Optional[Sequence[Quantizer]],
     weight_quantizers: Optional[Sequence[Quantizer]],
     input_requires_grad: bool = True,
@@ -117,21 +145,24 @@ def _grouped_linear_forward_with_split_quantize(
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     ### TODO Implement
 
+    with_quantized_compute = quantization_recipe is not None
+
     # Move split sizes to CPU for split-quantize
     split_sizes = [int(s) for s in split_sizes.tolist()]
+    num_groups = len(split_sizes)
 
     # Get discrete weight tensors
     if isinstance(weights, GroupedTensorStorage):
         weights = ws.split_into_quantized_tensors()
     if with_quantized_compute:
-        ws = [_to_dequantized(w, dtype) for w in weights]
-    else:
         ws = []
         for w, quantizer in zip(weights, weight_quantizers):
-            if not is_quantized_tensor(w):
+            if not isinstance(w, QuantizedTensorStorage):
                 quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
                 w = quantizer(w)
             ws.append(w)
+    else:
+        ws = [_to_dequantized(w, dtype) for w in weights]
 
     # Get discrete bias tensors
     if biases is not None:
@@ -154,16 +185,24 @@ def _grouped_linear_forward_with_split_quantize(
     if with_cpu_offload:
         start_offload(*xs)
 
-    # Allocate output tensor
+    # Allocate output tensor if needed
+    in_shape = input.size()
+    out_features, in_features = weights[0].size()
+    out_shape = (*in_shape[:-1], out_features)
     if out is None:
-        in_shape = input.size()
-        out_features, in_features = weights[0]
-        out = torch.empty(shape, dtype=dtype, device=device)
+        out = torch.empty(out_shape, dtype=dtype, device=device)
+    else:
+        if tuple(out.size()) != out_shape:
+            raise ValueError(
+                f"Expected output buffer with shape={out_shape}, "
+                f"but found shape={tuple(out.size())}."
+            )
 
     # Perform GEMMs
     with_fused_gemm_bias = biases is not None and bias_scales is None
+    use_split_accumulator = _use_split_accumulator("fprop", quantization_recipe)
     general_grouped_gemm(
-        weights,
+        ws,
         xs,
         [out],
         [None] * num_groups,  # quantization_params
@@ -171,7 +210,7 @@ def _grouped_linear_forward_with_split_quantize(
         m_splits=split_sizes,
         bias=biases if with_fused_gemm_bias else None,
         use_bias=with_fused_gemm_bias,
-        use_split_accumulator=_2X_ACC_FPROP,
+        use_split_accumulator=use_split_accumulator,
         single_output=True,
     )
 
@@ -219,14 +258,24 @@ def grouped_linear_forward(
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
-    with_quantized_compute: bool = False,
+    quantization_recipe: Optional[Recipe] = None,
     input_quantizers: Optional[Sequence[Quantizer]] = None,
     weight_quantizers: Optional[Sequence[Quantizer]] = None,
-    output_quantizers: Optional[Sequence[Quantizer]] = None,
     input_requires_grad: bool = True,
     weight_requires_grad: bool = True,
     with_cpu_offload: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
+
+    with_quantized_compute = quantization_recipe is not None
+    if with_quantized_compute:
+        if input_quantizers is None:
+            raise ValueError(
+                "Quantized compute is enabled, but input quantizers were not provided."
+            )
+        if weight_quantizers is None:
+            raise ValueError(
+                "Quantized compute is enabled, but weight quantizers were not provided."
+            )
 
     # Infer device and dtype if needed
     if dtype is None and out is not None:
@@ -278,10 +327,14 @@ def grouped_linear_forward(
         device=device,
         dtype=dtype,
         out=out,
-        with_quantized_compute=with_quantized_compute,
+        quantization_recipe=quantization_recipe,
         input_quantizers=input_quantizers,
-        weight_quantizer=weight_quantizers,
+        weight_quantizers=weight_quantizers,
         input_requires_grad=input_requires_grad,
         weight_requires_grad=weight_requires_grad,
         with_cpu_offload=with_cpu_offload,
     )
+
+def grouped_linear_backward():
+    ### TODO Implement
+    raise NotImplementedError

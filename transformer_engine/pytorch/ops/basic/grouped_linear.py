@@ -17,6 +17,7 @@ import transformer_engine_torch as tex
 from ...constants import DType
 from ...cpp_extensions import general_grouped_gemm, general_grouped_gemm_for_grouped_tensor
 from ...distributed import CudaRNGStatesTracker
+from ...functional import grouped_linear_forward
 from ...module._common import WeightGradStore
 from ...module.base import (
     _2X_ACC_FPROP,
@@ -965,10 +966,12 @@ class GroupedLinear(BasicOperation):
         weight_requires_grad = ctx.requires_grad and weight_param.requires_grad
 
         # Quantizers
+        quantization_recipe = None
         input_quantizers = None
         weight_quantizers = None
         with_quantized_compute = FP8GlobalStateManager.is_fp8_enabled()
         if with_quantized_compute:
+            quantization_recipe = FP8GlobalStateManager.get_fp8_recipe()
             input_quantizers = []
             weight_quantizers = []
             for idx in range(num_groups):
@@ -1020,7 +1023,7 @@ class GroupedLinear(BasicOperation):
             device=device,
             dtype=dtype,
             out=out_buffer,
-            with_quantized_compute=with_quantized_compute,
+            quantization_recipe=quantization_recipe,
             input_quantizers=input_quantizers,
             weight_quantizers=weight_quantizers,
             input_requires_grad=input_requires_grad,
@@ -1033,7 +1036,7 @@ class GroupedLinear(BasicOperation):
             ### TODO Implement
             raise NotImplementedError
         else:
-            tensors_to_save = []
+            tensors_to_save = [split_sizes, None, None]
             if self._scale_bias:
                 tensors_to_save.append(saved["bias_scales"])
             tensors_to_save.extend(saved["inputs"])

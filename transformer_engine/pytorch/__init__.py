@@ -105,6 +105,7 @@ from transformer_engine.pytorch.tensor.nvfp4_tensor import (
 from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
     _make_float8_blockwise_tensor_in_reduce_ex,
 )
+from transformer_engine.pytorch import functional
 
 try:
     torch._dynamo.config.error_on_nested_jit_trace = False
