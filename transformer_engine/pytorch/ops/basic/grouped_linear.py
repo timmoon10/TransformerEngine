@@ -1023,6 +1023,7 @@ class GroupedLinear(BasicOperation):
             device=device,
             dtype=dtype,
             out=out_buffer,
+            with_quantized_compute=with_quantized_compute,
             quantization_recipe=quantization_recipe,
             input_quantizers=input_quantizers,
             weight_quantizers=weight_quantizers,
@@ -1033,16 +1034,16 @@ class GroupedLinear(BasicOperation):
         )
 
         # Extract tensors to save
-        if saved["use_grouped_tensor_path"]:
-            ### TODO Implement
-            raise NotImplementedError
-        else:
+        if saved["backend"] == "split_tensors":
             tensors_to_save = [saved["split_sizes"], None, None]
             if self._scale_bias:
                 tensors_to_save.append(saved["bias_scales"])
             tensors_to_save.extend(saved["inputs"])
             tensors_to_save.extend(saved["weights"])
             tensors_to_save = [tuple(tensors_to_save)]
+        else:
+            ### TODO Implement
+            raise NotImplementedError
 
         # Save state in autograd context
         self.fuser_forward_save_ctx(
@@ -1054,7 +1055,7 @@ class GroupedLinear(BasicOperation):
             prev_op_grad_output_quantizer=prev_op_grad_output_quantizer,
             next_op_input_quantizer=next_op_input_quantizer,
             basic_op_kwargs=basic_op_kwargs,
-            use_grouped_tensor_path=saved["use_grouped_tensor_path"],
+            use_grouped_tensor_path=saved["backend"] == "grouped_tensor",
         )
 
         return out, [()]
@@ -1096,9 +1097,8 @@ class GroupedLinear(BasicOperation):
                     mark_activation_offload(grouped_x)
             else:
                 # Layout: [split_sizes, None, None, (scales?), *xs, *ws]
-                live_xs = [t for t in saved[offset : offset + self.num_groups] if t is not None]
-                if live_xs:
-                    mark_activation_offload(*live_xs)
+                ### TODO Remove, this branch isn't needed
+                pass
 
         ctx.save_for_backward(*tensors_to_save[0])
 

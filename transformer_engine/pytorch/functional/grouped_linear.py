@@ -54,6 +54,13 @@ def _is_grouped_tensor_path_supported(
             raise RuntimeError(message)
         return False
 
+    # Check envvar
+    if not bool(int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))):
+        return maybe_throw(
+            "Grouped GEMM is disabled by default, "
+            "override with NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=1."
+        )
+
     # Grouped tensor implementation is supported on Hopper and Blackwell (SM 10.x, 11.0)
     device_arch = get_device_compute_capability()
     if not (9, 0) <= device_arch <= (11, 0):
@@ -156,16 +163,16 @@ def _grouped_linear_forward_with_split_quantize(
     device: torch.device,
     dtype: torch.dtype,
     out: Optional[torch.Tensor],
+    with_quantized_compute: bool = False,
     quantization_recipe: Optional[Recipe] = None,
-    input_quantizers: Optional[Sequence[Quantizer]],
-    weight_quantizers: Optional[Sequence[Quantizer]],
+    with_debug_quantizers: bool = False,
+    input_quantizers: Optional[Sequence[Quantizer]] = None,
+    weight_quantizers: Optional[Sequence[Quantizer]] = None,
     input_requires_grad: bool = True,
     weight_requires_grad: bool = True,
-    with_cpu_offload: bool,
+    with_cpu_offload: bool = False,
+    update_usages_for_backward: bool = True,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    ### TODO Implement
-
-    with_quantized_compute = quantization_recipe is not None
 
     # Move split sizes to CPU for split-quantize
     split_sizes = split_sizes.to(device="cpu")
@@ -175,7 +182,7 @@ def _grouped_linear_forward_with_split_quantize(
     # Get discrete weight tensors
     if isinstance(weights, GroupedTensorStorage):
         weights = ws.split_into_quantized_tensors()
-    if with_quantized_compute:
+    if with_quantized_compute or with_debug_quantizers:
         ws = []
         for w, quantizer in zip(weights, weight_quantizers):
             if not isinstance(w, QuantizedTensorStorage):
@@ -190,17 +197,45 @@ def _grouped_linear_forward_with_split_quantize(
         if isinstance(biases, GroupedTensorStorage):
             biases = biases.split_into_quantized_tensors()
             biases = [b.reshape(-1) for b in biases]
-        biases = [_to_dequantized(b, dtype) for b in biases]
+        bias_dtype = dtype
+        if with_quantized_compute and dtype not in (torch.bfloat16, torch.float16):
+            # FP8 GEMM only supports BF16/FP16 bias
+            bias_dtype = torch.bfloat16
+        biases = [_to_dequantized(b, bias_dtype) for b in biases]
 
-    # Split input tensors and quantize if needed
+    # Get discrete input tensors
     x = _to_dequantized(input, dtype)
     xs = None
-    if with_quantized_compute:
+    if with_debug_quantizers:
+        xs = DebugQuantizer.multi_tensor_quantize(
+            x, input_quantizers, split_sizes_list, dtype
+        )
+    elif with_quantized_compute:
+        # Allocating a single large buffer and creating subviews has
+        # less CPU overhead than creating many small buffers. However,
+        # it does not work well with CPU offloading since the bulk
+        # allocation is not freed if even a single subview remains on
+        # GPU.
+        with_bulk_allocation = not with_cpu_offload
+
+        # Split input tensors and quantize each
         for quantizer in input_quantizers:
             quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
-        xs = tex.split_quantize(x, split_sizes_list, input_quantizers)
+        xs = tex.split_quantize(
+            x,
+            split_sizes_list,
+            input_quantizers,
+            disable_bulk_allocation=not with_bulk_allocation,
+        )
     else:
-        xs = torch.split(x, split_sizes_list)
+        dim0 = x.size(0)
+        last_split_point = sum(split_sizes_list)
+        if last_split_point == dim0:
+            xs = torch.split(x, split_sizes_list)
+        else:
+            padded_split_sizes = split_sizes_list + [dim0 - last_split_point]
+            xs = torch.split(x, padded_split_sizes)
+            xs = xs[:-1]
 
     # Activation CPU offloading
     if with_cpu_offload:
@@ -247,7 +282,7 @@ def _grouped_linear_forward_with_split_quantize(
     # Prepare weights for backward pass
     if not input_requires_grad:
         ws = [None] * num_groups
-    elif with_quantized_compute:
+    elif with_quantized_compute and update_usages_for_backward:
         for w, original_weight in zip(ws, weights):
             if w is not original_weight:
                 w.update_usage(rowwise_usage=False, columnwise_usage=True)
@@ -255,18 +290,18 @@ def _grouped_linear_forward_with_split_quantize(
     # Prepare input for backward pass
     if not weight_requires_grad:
         xs = [None] * num_groups
-    elif with_quantized_compute:
+    elif with_quantized_compute and update_usages_for_backward:
         for x in xs:
             x.update_usage(rowwise_usage=False, columnwise_usage=True)
 
     # Activation CPU offloading
     if with_cpu_offload:
         mark_activation_offload(*xs)
-        mark_not_offload(split_sizes, *ws)
+        mark_not_offload(split_sizes, bias_scales, *ws)
 
     # Saved state for backward pass
     saved = {
-        "use_grouped_tensor_path": False,
+        "backend": "split_tensors",
         "inputs": xs,
         "weights": ws,
         "split_sizes": split_sizes,
@@ -285,17 +320,19 @@ def grouped_linear_forward(
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
+    with_quantized_compute: bool = False,
     quantization_recipe: Optional[Recipe] = None,
+    with_debug_quantizers: bool = False,
     input_quantizers: Optional[Sequence[Quantizer]] = None,
     weight_quantizers: Optional[Sequence[Quantizer]] = None,
     input_requires_grad: bool = True,
     weight_requires_grad: bool = True,
     grouped_gemm_backend: str = "split_tensors",
     with_cpu_offload: bool = False,
+    update_usages_for_backward: bool = True,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
-    with_quantized_compute = quantization_recipe is not None
-    if with_quantized_compute:
+    if with_quantized_compute or with_debug_quantizers:
         if input_quantizers is None:
             raise ValueError(
                 "Quantized compute is enabled, but input quantizers were not provided."
@@ -357,12 +394,15 @@ def grouped_linear_forward(
         device=device,
         dtype=dtype,
         out=out,
+        with_quantized_compute=with_quantized_compute,
         quantization_recipe=quantization_recipe,
+        with_debug_quantizers=with_debug_quantizers,
         input_quantizers=input_quantizers,
         weight_quantizers=weight_quantizers,
         input_requires_grad=input_requires_grad,
         weight_requires_grad=weight_requires_grad,
         with_cpu_offload=with_cpu_offload,
+        update_usages_for_backward=update_usages_for_backward,
     )
 
 def grouped_linear_backward():
