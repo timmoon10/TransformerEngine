@@ -4,13 +4,13 @@
 
 """Python interface for GEMM extensions"""
 
-from typing import Iterable, Literal, Optional, Tuple, Union, List
+from typing import Callable, Iterable, Literal, Optional, Tuple, Union, List
 import os
 import functools
 import torch
 import transformer_engine_torch as tex
-from ..constants import TE_DType, DType
-from ..utils import get_sm_count, _empty_tensor
+from ..constants import MXFP8_BLOCK_SCALING_SIZE, NVFP4_BLOCK_SCALING_SIZE, TE_DType, DType
+from ..utils import ceil_div, get_cached_ones_tensor, get_sm_count, _empty_tensor
 
 from ..quantized_tensor import QuantizedTensorStorage, Quantizer
 from ..tensor.float8_blockwise_tensor import Float8BlockQuantizer
@@ -25,6 +25,7 @@ from ..tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
 from ..tensor.storage.nvfp4_tensor_storage import NVFP4TensorStorage
 from ..tensor.utils import is_custom
 from ..custom_recipes.gemm import custom_gemm
+from ..ops._common import validate_or_alloc_output
 from ...debug.pytorch.debug_quantization import DebugQuantizedTensor, DebugQuantizer
 
 __all__ = [
@@ -188,6 +189,294 @@ def _validate_native_gemm_output_quantizer(quantization_params):
         )
 
 
+@functools.lru_cache(maxsize=None)
+def grouped_gemm_quant_kernel() -> Callable:
+    """cuDNN CuTe DSL grouped GEMM kernel for block-scaled inputs."""
+    from cudnn import grouped_gemm_quant_wrapper_sm100  # pylint: disable=no-name-in-module
+
+    return grouped_gemm_quant_wrapper_sm100
+
+
+def convert_TE_MX_tensor_to_cuDNN_operand(
+    data: torch.Tensor,
+    scale_inv: torch.Tensor,
+    *,
+    data_dtype: torch.dtype,
+    scale_dtype: torch.dtype,
+    valid_M_or_N: int,
+    k_logical: int,
+    L: int = 1,
+    sf_swizzled: bool = False,
+    use_N_major_for_B: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reshape an plain buffer into the layout cuDNN's grouped GEMM expects.
+
+    cuDNN requirements:
+    A: (valid_m, K, 1), K-major
+    B: (N, K, L), K-major (FP8 also supports N-major)
+
+    SFA: (32, 4, ceil(valid_m/128), 4, ceil(ceil(K/sf_vec_size)/4), 1)
+    SFB: (32, 4, ceil(N/128),       4, ceil(ceil(K/sf_vec_size)/4), L)
+
+    whereas TE stores flat buffers which can be intepreted as contiguous tensors
+    with the following layouts:
+
+    Note: K_packed is K/2 for FP4 (two values per byte) and K for FP8
+
+    A (K-major):    (1, valid_m, K_packed)
+    B (K-major):    (L, N,       K_packed)   -- used for FP4 only now
+    B (N-major):    (L, K,       N)          -- used for FP8 only now
+
+    SFA (unswizzled): (1, ceil(valid_m/128), 4, 32, ceil(ceil(K/sf_vec_size)/4), 4)
+    SFB (unswizzled): (L, ceil(N/128),       4, 32, ceil(ceil(K/sf_vec_size)/4), 4)
+    SFA (swizzled): (1, ceil(valid_m/128), ceil(ceil(K/sf_vec_size)/4), 32, 4, 4)
+    SFB (swizzled): (L, ceil(N/128),       ceil(ceil(K/sf_vec_size)/4), 32, 4, 4)
+    """
+
+    if use_N_major_for_B:
+        assert data_dtype in (torch.float8_e4m3fn, torch.float8_e5m2), \
+            f"Using N-major layout for B is only supported for FP8, but got {data_dtype}."
+
+    available_scalings = {
+        # NVFP4 recipe (UE5M3 rides as E4M3 since torch has no ue5m3 dtype)
+        (torch.float4_e2m1fn_x2, torch.float8_e4m3fn): NVFP4_BLOCK_SCALING_SIZE,
+        # MXFP8 recipe
+        (torch.float8_e4m3fn, torch.float8_e8m0fnu): MXFP8_BLOCK_SCALING_SIZE,
+    }
+    assert (data_dtype, scale_dtype) in available_scalings, (
+        "Unsupported (data_dtype, scale_dtype) pair for a cuDNN block-scaled operand: "
+        f"({data_dtype}, {scale_dtype}). Expected NVFP4 (float4_e2m1fn_x2, "
+        "float8_e4m3fn) or MXFP8 (float8_e4m3fn, float8_e8m0fnu)."
+    )
+    sf_vec_size = available_scalings[(data_dtype, scale_dtype)]
+
+    k_sf_tiles = ceil_div(k_logical, 4 * sf_vec_size)
+
+    if data_dtype == torch.float4_e2m1fn_x2:
+        k_packed = k_logical // 2  # fp4 packs two values per byte
+    else:
+        k_packed = k_logical # fp8 packs one value per byte
+
+    data = data.view(dtype=data_dtype)
+    if use_N_major_for_B:
+        # B is stored untransposed, i.e. (L, K, N); permuting to (N, K, L) leaves
+        # stride 1 on N. Only FP8 accepts this, asserted above.
+        data = data.view(L, k_packed, valid_M_or_N)
+        data = data.permute(2, 1, 0)
+    else:
+        # (L, N, K) -> (N, K, L), stride 1 on K.
+        data = data.view(L, valid_M_or_N, k_packed)
+        data = data.permute(1, 2, 0)
+
+    if sf_swizzled:
+        scale_inv = scale_inv.view(dtype=scale_dtype)
+        scale_inv = scale_inv.view(
+            L,
+            ceil_div(valid_M_or_N, 128),
+            k_sf_tiles,
+            32,
+            4,
+            4,
+        )
+        scale_inv = scale_inv.permute(3, 4, 1, 5, 2, 0)
+        return data, scale_inv
+
+    scale_inv = scale_inv.view(dtype=scale_dtype)
+    scale_inv = scale_inv.view(
+        L,
+        ceil_div(valid_M_or_N, 128),
+        4,
+        32,
+        k_sf_tiles,
+        4,
+    )
+    scale_inv = scale_inv.permute(3, 2, 1, 5, 4, 0)
+    return data, scale_inv
+
+
+def general_cuDNN_MX_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: Optional[torch.dtype] = None,
+    quantization_params: Optional[Quantizer] = None,
+    gelu: bool = False,
+    gelu_in: torch.Tensor = None,
+    alpha: float = 1.0,
+    beta: Optional[float] = None,
+    accumulate: bool = False,
+    layout: str = "TN",
+    out: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    use_split_accumulator: bool = False,
+    grad: bool = False,
+    ub: Union[tex.CommOverlap, tex.CommOverlapP2P] = None,
+    ub_type: tex.CommOverlapType = None,
+    extra_output: Optional[torch.Tensor] = None,
+    bulk_overlap: bool = False,
+) -> Iterable[Optional[torch.Tensor]]:
+    """Perform GEMM via cuDNN kernels
+
+    The parameters passed are in cuBLAS notation, where
+    D = alpha * op(B) @ op(A) + beta * C, where the shape is always
+    (M, N) = (M, K) @ (K, N) + (M, N)
+
+    B:
+    - "N" is (M, K), which is always TE's rowwise data, and op(B) is B
+    - "T" is (K, M), which is always TE's colwise data, and op(B) is B.T
+    A
+    - "N" is (K, N), which is always TE's colwise data, and op(A) is A
+    - "T" is (N, K), which is always TE's rowwise data, and op(A) is A.T
+
+    Note: layout string means layout of "A" and "B" respectively.
+
+    We use cuDNN-frontend's grouped_gemm_quant_wrapper_sm100 API here which is supposed to be a grouped GEMM
+    but here we set groups = 1 so it is effectively a single GEMM.
+    """
+    assert isinstance(A, NVFP4TensorStorage) and isinstance(B, NVFP4TensorStorage) and \
+        A.get_metadata()["scale_dtype"] == DType.kFloat8UE5M3 and B.get_metadata()["scale_dtype"] == DType.kFloat8UE5M3, \
+        f"cuDNN MX GEMM is only used for NVFP4 GEMM with e5m3 scale factors for now."
+
+    assert quantization_params is None, "cuDNN GEMM currently does not support output quantization."
+    assert gelu is False and gelu_in is None, "cuDNN GEMM currently does not support fused GELU."
+    assert accumulate is False, "cuDNN GEMM currently does not support accumulation."
+    # `grad` only changes behaviour when a bias is supplied: it turns the bias slot
+    # into a bias-gradient output, which cuDNN has no epilogue for. Backward GEMMs
+    # that pass grad=True without a bias need nothing special.
+    assert not (grad and bias is not None), (
+        "cuDNN GEMM currently does not support fused bias gradient."
+    )
+    # use_split_accumulator is deliberately not checked: it is a cuBLAS knob for
+    # raising accumulator precision, and the cuDNN kernel always accumulates in
+    # FP32, so the request is already satisfied either way.
+    assert ub is None and ub_type is None, "cuDNN GEMM currently does not support CommOverlap."
+    assert extra_output is None, "cuDNN GEMM currently does not support extra output."
+    assert bulk_overlap is False, "cuDNN GEMM currently does not support bulk overlap."
+
+    assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
+    transa = layout[0] == "T"
+    transb = layout[1] == "T"
+
+    assert out_dtype in (torch.float32, torch.float16, torch.bfloat16), \
+        f"cuDNN MX GEMM currently only supports float32, float16, and bfloat16 outputs, but got {out_dtype}."
+
+    device = A.device
+
+    # cuDNN only accepts GEMM-swizzled scale factors -- an unswizzled buffer is
+    # rejected on its strides -- so swizzle first if the quantizer did not
+    # (optimize_for_gemm defaults to False). This mirrors what the cuBLAS path
+    # does in C++ via swizzle_scales_for_gemm. The call is in-place, swizzles
+    # both orientations, and no-ops when the tensor is already swizzled.
+    if not A._with_gemm_swizzled_scales:
+        tex.swizzle_scales_for_gemm_(A)
+    if not B._with_gemm_swizzled_scales:
+        tex.swizzle_scales_for_gemm_(B)
+
+    # Pick the buffer whose block scales run along K. In every case the selected
+    # buffer is physically (rows, K_packed), so the reshape below is uniform.
+    # LHS is always (M, K)
+    if transb:
+        dataB, sfB, amaxB = B._columnwise_data, B._columnwise_scale_inv, B._amax_columnwise
+    else:
+        dataB, sfB, amaxB = B._rowwise_data, B._rowwise_scale_inv, B._amax_rowwise
+    # RHS is always (K, N)
+    if transa:
+        dataA, sfA, amaxA = A._rowwise_data, A._rowwise_scale_inv, A._amax_rowwise
+    else:
+        dataA, sfA, amaxA = A._columnwise_data, A._columnwise_scale_inv, A._amax_columnwise
+
+    # Find the logical shapes (not the physical shapes where K is packed with 2 fp4 stored in 1 byte).
+    M, K = dataB.numel() // dataB.shape[-1], dataB.shape[-1] * 2
+    N, k_from_a = dataA.numel() // dataA.shape[-1], dataA.shape[-1] * 2
+    assert K == k_from_a, f"Contraction dims disagree: A implies {k_from_a}, B implies {K}."
+
+    # The output keeps B's leading dims. They only exist when B is read row-wise:
+    # the column-wise NVFP4 buffer is physically transposed and always 2D, and the
+    # layouts that select it give B the logical shape (K, M).
+    out_shape = (*dataB.shape[:-1], N) if not transb else (M, N)
+
+    # cuDNN's own operand names are the other way round: its "a" is the (M, K)
+    # activation-like operand (TE's B) and its "b" is the (N, K) weight-like one
+    # (TE's A).
+    cudnn_a, cudnn_sfa = convert_TE_MX_tensor_to_cuDNN_operand(
+        dataB,
+        sfB,
+        data_dtype=torch.float4_e2m1fn_x2,
+        scale_dtype=torch.float8_e4m3fn,  # e5m3 rides as e4m3; torch has no ue5m3
+        valid_M_or_N=M,
+        k_logical=K,
+        L=1,
+        sf_swizzled=True,  # ensured above
+    )
+    cudnn_b, cudnn_sfb = convert_TE_MX_tensor_to_cuDNN_operand(
+        dataA,
+        sfA,
+        data_dtype=torch.float4_e2m1fn_x2,
+        scale_dtype=torch.float8_e4m3fn,  # e5m3 rides as e4m3; torch has no ue5m3
+        valid_M_or_N=N,
+        k_logical=K,
+        L=1,
+        sf_swizzled=True,  # ensured above
+    )
+
+    # Row-scaled NVFP4 stores one amax per row instead of one per tensor, which
+    # this path cannot express; general_gemm handles that mode separately.
+    for name, amax in (("A", amaxA), ("B", amaxB)):
+        assert amax is None or amax.numel() == 1, (
+            f"cuDNN MX GEMM expects a per-tensor amax for {name}, but got {amax.numel()} "
+            "values. Row-scaled NVFP4 is not supported on this path."
+        )
+
+    # Prepare alpha. cuDNN applies the block scales but not TE's per-tensor global
+    # scale, so alpha carries the product of both operands'. A tensor quantized
+    # without second-level scaling has no amax and contributes a factor of one.
+    
+    # general_gemm normalizes alpha/beta only on its cuBLAS path, downstream of the
+    # dispatch here, so callers can still reach this with alpha=None meaning one.
+    alpha = validate_gemm_scale(alpha, True)
+    validate_gemm_scale(beta, accumulate)
+    nvfp4_global_scale = 6.0 * 114688.0
+    ones = get_cached_ones_tensor(1, dtype=torch.float32, device=device)
+    scaleA = ones if amaxA is None else amaxA.to(torch.float32).reshape(1) / nvfp4_global_scale
+    scaleB = ones if amaxB is None else amaxB.to(torch.float32).reshape(1) / nvfp4_global_scale
+    alpha_tensor = (alpha * scaleA * scaleB).to(torch.float32)
+
+    if bias is not None:
+        assert bias.dim() == 1 and bias.shape[0] == N, (
+            f"cuDNN MX GEMM expects a ({N},) bias, but got {tuple(bias.shape)}."
+        )
+        # cuDNN checks the stride literally, so (1, N) rather than reshape's (1, 1).
+        bias = bias.contiguous().as_strided((N, 1), (1, N))
+
+    # Prepare for output
+    out = validate_or_alloc_output(out, out_shape, out_dtype, device)
+    d_tensor = out.view(M, N).as_strided((M, N, 1), (N, 1, M * N))
+
+    gemm_kwargs = {
+        "a_tensor": cudnn_a,
+        "sfa_tensor": cudnn_sfa,
+        "b_tensor": cudnn_b,
+        "sfb_tensor": cudnn_sfb,
+        # One group, so the only padded end offset is the full row count.
+        "padded_offsets": torch.tensor([M], dtype=torch.int32, device=device),
+        "alpha_tensor": alpha_tensor,
+        "bias_tensor": bias,
+        "norm_const_tensor": None,  # must be None for FP4 inputs
+        "acc_dtype": torch.float32,
+        "d_dtype": out_dtype,  # high precision -> no output quantization
+        "d_tensor": d_tensor,
+        "cd_major": "n", # only "n" is supported by cuDNN
+        "sf_vec_size": NVFP4_BLOCK_SCALING_SIZE, # Hardcode to NVFP4 for now
+        "sf_fp8_dtype_override": "e5m3", # Hardcode for now
+        "current_stream": torch.cuda.current_stream().cuda_stream,
+        "discrete_col_sfd": False,
+        "use_dynamic_sched": True,
+    }
+    grouped_gemm_quant_kernel()(**gemm_kwargs)
+
+    # Matches general_gemm's contract: (out, bias_grad, gelu_input, extra_output).
+    return out, None, None, None
+
+
 def general_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -209,6 +498,39 @@ def general_gemm(
     bulk_overlap: bool = False,
 ) -> Iterable[Optional[torch.Tensor]]:
     """GEMM supporting fp8 inputs."""
+
+    route_to_cuDNN = False
+    # Route NVFP4 GEMM with e5m3 scale factors to cuDNN since cuBLAS is not ready yet.
+    # Test against the storage class, not NVFP4Tensor: the ops and module paths hand
+    # this function bare NVFP4TensorStorage operands, and NVFP4Tensor subclasses it.
+    if isinstance(A, NVFP4TensorStorage) and isinstance(B, NVFP4TensorStorage):
+        if (
+            A.get_metadata()["scale_dtype"] == DType.kFloat8UE5M3
+            and B.get_metadata()["scale_dtype"] == DType.kFloat8UE5M3
+        ):
+            route_to_cuDNN = True
+
+    if route_to_cuDNN:
+        return general_cuDNN_MX_gemm(
+            A,
+            B,
+            out_dtype,
+            quantization_params,
+            gelu,
+            gelu_in,
+            alpha,
+            beta,
+            accumulate,
+            layout,
+            out,
+            bias,
+            use_split_accumulator,
+            grad,
+            ub,
+            ub_type,
+            extra_output,
+            bulk_overlap,
+        )
 
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     transa = layout[0] == "T"
