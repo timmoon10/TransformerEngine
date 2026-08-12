@@ -394,6 +394,24 @@ def general_cuDNN_MX_gemm(
     # layouts that select it give B the logical shape (K, M).
     out_shape = (*dataB.shape[:-1], N) if not transb else (M, N)
 
+    # cuDNN's grouped quant kernel requires M to be divisible by 256 so we need to pad it
+    M_padded = ceil_div(M, 256) * 256
+    if M_padded != M:
+        k_packed = dataB.shape[-1]
+        src = dataB.reshape(M, k_packed)
+        buf = src.new_zeros((M_padded, k_packed))
+        buf[:M].copy_(src)
+        dataB = buf
+
+        # Swizzled scales are blocked by 128 rows:
+        # (1, ceil(M/128), k_sf_tiles, 32, 4, 4)
+        per_block = ceil_div(K, 4 * NVFP4_BLOCK_SCALING_SIZE) * 32 * 4 * 4
+        n_blk, n_blk_padded = ceil_div(M, 128), ceil_div(M_padded, 128)
+        src_sf = sfB.reshape(-1)[: n_blk * per_block].reshape(n_blk, per_block)
+        buf_sf = src_sf.new_zeros((n_blk_padded, per_block))
+        buf_sf[:n_blk].copy_(src_sf)
+        sfB = buf_sf
+
     # cuDNN's own operand names are the other way round: its "a" is the (M, K)
     # activation-like operand (TE's B) and its "b" is the (N, K) weight-like one
     # (TE's A).
@@ -402,7 +420,7 @@ def general_cuDNN_MX_gemm(
         sfB,
         data_dtype=torch.float4_e2m1fn_x2,
         scale_dtype=torch.float8_e4m3fn,  # e5m3 rides as e4m3; torch has no ue5m3
-        valid_M_or_N=M,
+        valid_M_or_N=M_padded,
         k_logical=K,
         L=1,
         sf_swizzled=True,  # ensured above
@@ -449,7 +467,12 @@ def general_cuDNN_MX_gemm(
 
     # Prepare for output
     out = validate_or_alloc_output(out, out_shape, out_dtype, device)
-    d_tensor = out.view(M, N).as_strided((M, N, 1), (N, 1, M * N))
+    if M_padded != M:
+        # The kernel writes M_padded rows, so it cannot target `out` directly.
+        d_buf = torch.empty((M_padded, N), dtype=out_dtype, device=device)
+        d_tensor = d_buf.as_strided((M_padded, N, 1), (N, 1, M_padded * N))
+    else:
+        d_tensor = out.view(M, N).as_strided((M, N, 1), (N, 1, M * N))
 
     gemm_kwargs = {
         "a_tensor": cudnn_a,
@@ -457,7 +480,7 @@ def general_cuDNN_MX_gemm(
         "b_tensor": cudnn_b,
         "sfb_tensor": cudnn_sfb,
         # One group, so the only padded end offset is the full row count.
-        "padded_offsets": torch.tensor([M], dtype=torch.int32, device=device),
+        "padded_offsets": torch.tensor([M_padded], dtype=torch.int32, device=device),
         "alpha_tensor": alpha_tensor,
         "bias_tensor": bias,
         "norm_const_tensor": None,  # must be None for FP4 inputs
@@ -472,6 +495,11 @@ def general_cuDNN_MX_gemm(
         "use_dynamic_sched": True,
     }
     grouped_gemm_quant_kernel()(**gemm_kwargs)
+
+    if M_padded != M:
+        # Drop the zero-padded rows. Safe to overwrite rather than accumulate:
+        # this path asserts accumulate is False above.
+        out.view(M, N).copy_(d_buf[:M])
 
     # Matches general_gemm's contract: (out, bias_grad, gelu_input, extra_output).
     return out, None, None, None
