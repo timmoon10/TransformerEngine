@@ -190,6 +190,83 @@ def _validate_native_gemm_output_quantizer(quantization_params):
 
 
 @functools.lru_cache(maxsize=None)
+def grouped_gemm_wgrad_kernel() -> Callable:
+    """cuDNN CuTe DSL grouped wgrad kernel for block-scaled inputs."""
+    from cudnn import grouped_gemm_wgrad_wrapper_sm100  # pylint: disable=no-name-in-module
+
+    return grouped_gemm_wgrad_wrapper_sm100
+
+
+def _cuDNN_wgrad_gemm(
+    a_tensor: torch.Tensor,
+    b_tensor: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    amax_a: Optional[torch.Tensor],
+    amax_b: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+    accumulate: bool,
+    alpha: Optional[float] = None,
+) -> Iterable[Optional[torch.Tensor]]:
+    """Compute dw = dy^T @ x with cuDNN's purpose-built grouped wgrad kernel."""
+
+    # Column-wise NVFP4 buffers are physically (features, tokens), FP4-packed
+    # two values per byte along the token dim.
+    tokens_packed = a_tensor.shape[-1]
+    tokens = tokens_packed * 2
+    out_features = a_tensor.numel() // tokens_packed
+    in_features = b_tensor.numel() // tokens_packed
+
+    # grouped_gemm_wgrad_wrapper_sm100 wants:
+    #     a_tensor  (feature_out, tokens)      K-major, FP4-packed
+    #     b_tensor  (tokens, feature_in)
+    #     sfa       (round_up(feature_out, 128), scale_cols)
+    #     sfb       (round_up(feature_in, 128),  scale_cols)
+    fp4 = torch.float4_e2m1fn_x2
+    a_tensor = a_tensor.view(dtype=fp4).view(out_features, tokens_packed)
+    b_tensor = b_tensor.view(dtype=fp4).view(in_features, tokens_packed).T
+
+    # Create the scale factor tensors with the logical layout cuDNN expects
+    # In general_cuDNN_MX_gemm we've already ensured they are swizzled physically
+    def _sf(scale_inv, features):
+        leading = ceil_div(features, 128) * 128
+        return scale_inv.view(leading, -1).view(dtype=torch.float8_e4m3fn)
+
+    # grouped_gemm_wgrad_wrapper_sm100 expects two separate global_scale
+    ones = get_cached_ones_tensor(1, dtype=torch.float32, device=a_tensor.device)
+    denom = 6.0 * 114688.0  # fp4_max * fp8_max(UE5M3)
+    global_scale_a = ones if amax_a is None else amax_a.to(torch.float32).reshape(1) / denom
+    global_scale_b = ones if amax_b is None else amax_b.to(torch.float32).reshape(1) / denom
+    # Fold alpha into one of them if it's given
+    if alpha is not None and alpha != 1.0:
+        global_scale_a = global_scale_a * alpha
+
+    out = validate_or_alloc_output(out, (out_features, in_features), out_dtype, a_tensor.device)
+    grouped_gemm_wgrad_kernel()(
+        a_tensor=a_tensor,
+        b_tensor=b_tensor,
+        sfa_tensor=_sf(sfa, out_features),
+        sfb_tensor=_sf(sfb, in_features),
+        offsets_tensor=torch.tensor([tokens], dtype=torch.int32, device=a_tensor.device),
+        global_scale_a=global_scale_a,
+        global_scale_b=global_scale_b,
+        acc_dtype=torch.float32,
+        wgrad_dtype=out.dtype,
+        output_mode="dense",
+        wgrad_tensor=out.view(1, out_features, in_features),
+        sf_vec_size=NVFP4_BLOCK_SCALING_SIZE,
+        sf_fp8_dtype_override="e5m3",
+        input_order="tensor_ragged",
+        accumulate_on_output=accumulate,
+        current_stream=torch.cuda.current_stream().cuda_stream,
+    )
+
+    # Matches general_gemm's contract: (out, bias_grad, gelu_input, extra_output).
+    return out, None, None, None
+
+
+@functools.lru_cache(maxsize=None)
 def grouped_gemm_quant_kernel() -> Callable:
     """cuDNN CuTe DSL grouped GEMM kernel for block-scaled inputs."""
     from cudnn import grouped_gemm_quant_wrapper_sm100  # pylint: disable=no-name-in-module
@@ -329,8 +406,17 @@ def general_cuDNN_MX_gemm(
 
     Note: layout string means layout of "A" and "B" respectively.
 
-    We use cuDNN-frontend's grouped_gemm_quant_wrapper_sm100 API here which is supposed to be a grouped GEMM
-    but here we set groups = 1 so it is effectively a single GEMM.
+    TE stores x (token, feature_in), w (feature_out, feature_in) and dy (token, feature_out) in physical rowwise direction.
+    For cuBLAS:
+    fprop = x @ wT: token is M, feature_in is K, feature_out is N, so it's TN (x as B, w transposed to wT as A)
+    dgrad = dy @ w: token is M, feature_out is K, feature_in is N, so it's NN (dy as B, w as A)
+    wgrad = dyT @ x: feature_out is M, token is K, feature_in is N, so it's NT (dy transposed to dyT as B, x as A)
+
+    We use cuDNN-frontend's APIs here which are supposed to be used for grouped GEMM but we set groups = 1
+    so it is effectively a single GEMM.
+
+    Naming convention: uppercase letters (A, B) are used for cuBLAS notation, lowercase letters (a, b) are used for cuDNN notation.
+                       where cuBLAS's B is cuDNN's a, and cuBLAS's A is cuDNN's b (their notation is inverted).
     """
     assert isinstance(A, NVFP4TensorStorage) and isinstance(B, NVFP4TensorStorage) and \
         A.get_metadata()["scale_dtype"] == DType.kFloat8UE5M3 and B.get_metadata()["scale_dtype"] == DType.kFloat8UE5M3, \
@@ -338,13 +424,7 @@ def general_cuDNN_MX_gemm(
 
     assert quantization_params is None, "cuDNN GEMM currently does not support output quantization."
     assert gelu is False and gelu_in is None, "cuDNN GEMM currently does not support fused GELU."
-    assert accumulate is False, "cuDNN GEMM currently does not support accumulation."
-    # `grad` only changes behaviour when a bias is supplied: it turns the bias slot
-    # into a bias-gradient output, which cuDNN has no epilogue for. Backward GEMMs
-    # that pass grad=True without a bias need nothing special.
-    assert not (grad and bias is not None), (
-        "cuDNN GEMM currently does not support fused bias gradient."
-    )
+
     # use_split_accumulator is deliberately not checked: it is a cuBLAS knob for
     # raising accumulator precision, and the cuDNN kernel always accumulates in
     # FP32, so the request is already satisfied either way.
@@ -371,6 +451,13 @@ def general_cuDNN_MX_gemm(
     if not B._with_gemm_swizzled_scales:
         tex.swizzle_scales_for_gemm_(B)
 
+    # `grad` only changes behaviour when a bias is supplied: it turns the bias slot
+    # into a bias-gradient output, which cuDNN has no epilogue for. Backward GEMMs
+    # that pass grad=True without a bias need nothing special.
+    assert not (grad and bias is not None), (
+        "cuDNN GEMM currently does not support fused bias gradient."
+    )
+
     # Pick the buffer whose block scales run along K. In every case the selected
     # buffer is physically (rows, K_packed), so the reshape below is uniform.
     # LHS is always (M, K)
@@ -388,6 +475,32 @@ def general_cuDNN_MX_gemm(
     M, K = dataB.numel() // dataB.shape[-1], dataB.shape[-1] * 2
     N, k_from_a = dataA.numel() // dataA.shape[-1], dataA.shape[-1] * 2
     assert K == k_from_a, f"Contraction dims disagree: A implies {k_from_a}, B implies {K}."
+
+    # Route NT (implying wgrad) to cuDNN-FE's wgrad API instead of the general GEMM one
+    if layout == "NT" and bias is None: # The wgrad kernel has no bias epilogue
+        alpha = alpha if alpha is not None else 1.0
+        # This path uses cuDNN's wgrad (grouped_gemm_wgrad_wrapper_sm100) which supports grad accumulation
+        if accumulate: # Accumulate GEMM's result to the out tensorn
+            assert beta in (1.0, None), "beta must be one or None if accumulate is True"
+        else: # Overwrite GEMM's result to the out tensor
+            assert beta in (0.0, None), "beta must be zero or None if not accumulate"
+        return _cuDNN_wgrad_gemm(
+            a_tensor=dataB,
+            b_tensor=dataA,
+            sfa=sfB,
+            sfb=sfA,
+            amax_a=amaxB,
+            amax_b=amaxA,
+            out_dtype=out_dtype,
+            out=out,
+            accumulate=accumulate,
+            alpha=alpha
+        )
+
+    alpha = alpha if alpha is not None else 1.0
+    # cuDNN's general GEMM path (grouped_gemm_quant_wrapper_sm100) doesn't support accumulation
+    assert accumulate is False, "cuDNN GEMM currently does not support accumulation for this operation."
+    assert beta in (0.0, None), "beta must be zero or None if not accumulate"
 
     # The output keeps B's leading dims. They only exist when B is read row-wise:
     # the column-wise NVFP4 buffer is physically transposed and always 2D, and the
@@ -447,11 +560,6 @@ def general_cuDNN_MX_gemm(
     # Prepare alpha. cuDNN applies the block scales but not TE's per-tensor global
     # scale, so alpha carries the product of both operands'. A tensor quantized
     # without second-level scaling has no amax and contributes a factor of one.
-    
-    # general_gemm normalizes alpha/beta only on its cuBLAS path, downstream of the
-    # dispatch here, so callers can still reach this with alpha=None meaning one.
-    alpha = validate_gemm_scale(alpha, True)
-    validate_gemm_scale(beta, accumulate)
     nvfp4_global_scale = 6.0 * 114688.0
     ones = get_cached_ones_tensor(1, dtype=torch.float32, device=device)
     scaleA = ones if amaxA is None else amaxA.to(torch.float32).reshape(1) / nvfp4_global_scale
