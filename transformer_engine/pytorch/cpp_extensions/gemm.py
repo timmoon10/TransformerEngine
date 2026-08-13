@@ -862,7 +862,7 @@ def general_gemm(
         gemm_kwargs = dict(kwargs)
         gemm_kwargs["beta"] = 0.0
         out, bias_grad, gelu_input, extra_output = tex.generic_gemm(*gemm_args, **gemm_kwargs)
-        out_2d = out.view(N, M)
+        out_2d = out.reshape(-1, out.shape[-1])
 
         assert output_row_scales.numel() in (1, out_2d.shape[0])
         assert output_col_scales.numel() in (1, out_2d.shape[1])
@@ -983,6 +983,7 @@ def general_grouped_gemm(
                 layout=layout,
                 accumulate=accumulate,
                 out=out_views[i],
+                gelu=gelu,
                 bias=bias[i] if use_bias else None,
                 use_split_accumulator=use_split_accumulator,
                 grad=grad,

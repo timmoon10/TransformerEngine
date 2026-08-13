@@ -59,7 +59,7 @@ from ..cpp_extensions import (
     general_grouped_gemm,
     general_grouped_gemm_for_grouped_tensor,
 )
-from ..constants import GemmParallelModes, dist_group_type
+from ..constants import DType, GemmParallelModes, dist_group_type
 from ..jit import no_torch_dynamo
 from ..cpu_offload import is_cpu_offload_enabled, mark_not_offload, start_offload
 from ..triton.grouped_dbias_dscales import compute_grouped_dbias
@@ -476,6 +476,7 @@ class _GroupedLinear(torch.autograd.Function):
         activation_dtype: torch.dtype,
         input_quantizers: List[Optional[Quantizer]],
         output_quantizers: List[Optional[Quantizer]],
+        single_grouped_weight: bool,
     ) -> bool:
         """Whether to use cuBLASLt grouped GEMM through GroupedTensor metadata.
 
@@ -522,11 +523,11 @@ class _GroupedLinear(torch.autograd.Function):
         device_arch = get_device_compute_capability()
 
         # Unquantized compute
-        if not with_quantized_compute:
+        if not fp8:
             if not (9, 0) <= device_arch <= (11, 0):
                 # cuBLAS supports grouped GEMM on Hopper+
                 return False
-            return dtype in (torch.bfloat16, torch.float16)
+            return activation_dtype in (torch.bfloat16, torch.float16)
 
         # FP8 current scaling
         if all(isinstance(q, Float8CurrentScalingQuantizer) for q in input_quantizers):
@@ -916,6 +917,7 @@ class _GroupedLinear(torch.autograd.Function):
             delayed_scaling_input_quantizer,
             unsafe_requantization_input_quantizer,
             debug,
+            single_grouped_weight,
         ) = non_tensor_args
         if fp8:
             backward_override = FP8GlobalStateManager.get_fp8_recipe().backward_override
@@ -1016,6 +1018,7 @@ class _GroupedLinear(torch.autograd.Function):
             activation_dtype=activation_dtype,
             input_quantizers=input_quantizers,
             output_quantizers=output_quantizers,
+            single_grouped_weight=single_grouped_weight,
         ):
             return _GroupedLinear._forward_grouped_tensor(
                 ctx,
@@ -2423,6 +2426,7 @@ class GroupedLinear(TransformerEngineBaseModule):
                 self._delayed_scaling_input_quantizer,
                 self._unsafe_requantization_input_quantizer,
                 debug,
+                self.single_grouped_weight,
             )
             out, new_workspaces = linear_fn(
                 *autograd_ctx,
