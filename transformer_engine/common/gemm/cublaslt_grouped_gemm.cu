@@ -16,7 +16,7 @@
 #include <vector>
 
 #include "../cast/mxfp8/swizzle.cuh"
-#include "../cast/nvfp4/core_nvfp4.cuh"
+#include "../cast/nvfp4/scale_traits_nvfp4.cuh"
 #include "../common.h"
 #include "../util/cuda_runtime.h"
 #include "../util/handle_manager.h"
