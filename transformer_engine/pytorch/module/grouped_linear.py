@@ -501,10 +501,11 @@ class _GroupedLinear(torch.autograd.Function):
         Input/weight/grad_output quantizers are assumed to be of the same type, otherwise it would
         trigger a fatal error in the cuBLASLt grouped GEMM check.
         """
-        # 1. Filter by environment variable
+        # Filter by environment variable
         if not bool(int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))):
             return False
-        # 2. Filter out advanced features
+
+        # Filter out advanced features
         if (
             debug
             or cpu_offloading
@@ -513,47 +514,59 @@ class _GroupedLinear(torch.autograd.Function):
             or save_original_input
         ):
             return False
-        # 3. Filter by compute capability and cuBLAS version
-        device_capability = get_device_compute_capability()
-        if not (9, 0) <= device_capability <= (11, 0):
-            return False
-        cublaslt_version = tex.get_cublasLt_version()
-        if cublaslt_version < 130300:
-            return False
-        if device_capability < (10, 0) and cublaslt_version < 130400:
-            return False
-        # 4. Output quantization is not supported.
+
+        # Output quantization is not supported.
         if any(q is not None for q in output_quantizers):
             return False
-        # 5. Filter by quantization recipes.
-        if fp8:
-            if all(isinstance(q, Float8CurrentScalingQuantizer) for q in input_quantizers):
-                # FP8 per-tensor scaling grouped GEMM on Hopper requires cuBLAS 13.5+.
-                if device_capability < (10, 0) and cublaslt_version < 130500:
-                    return False
-                return True
-            if all(isinstance(q, Float8BlockQuantizer) for q in input_quantizers):
-                # Grouped FP8 block-scaling quantize kernels and cuBLASLt grouped GEMM
-                # scale modes are Hopper-only, and the fused path has no MXFP8-broadcast
-                # emulation. On Blackwell (SM100/SM110, the only other arch that reaches
-                # this branch) fail loudly rather than silently falling back to the
-                # unfused path the user explicitly opted out of.
-                if get_device_compute_capability() >= (10, 0):
-                    raise RuntimeError(
-                        "NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=1 does not support the"
-                        " FP8 block-scaling recipe on Blackwell GPUs: the fused grouped"
-                        " FP8 block-scaling path is Hopper-only. Unset"
-                        " NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM to use the unfused"
-                        " path (emulated via MXFP8 GEMM on Blackwell)."
-                    )
-                return True
-            # MXFP8 and NVFP4 require Blackwell+.
-            if not (10, 0) <= device_capability <= (11, 0):
+
+        device_arch = get_device_compute_capability()
+
+        # Unquantized compute
+        if not with_quantized_compute:
+            if not (9, 0) <= device_arch <= (11, 0):
+                # cuBLAS supports grouped GEMM on Hopper+
                 return False
-            return all(isinstance(q, MXFP8Quantizer) for q in input_quantizers) or all(
-                isinstance(q, NVFP4Quantizer) and q.with_rht for q in input_quantizers
-            )
-        return activation_dtype in (torch.bfloat16, torch.float16)
+            return dtype in (torch.bfloat16, torch.float16)
+
+        # FP8 current scaling
+        if all(isinstance(q, Float8CurrentScalingQuantizer) for q in input_quantizers):
+            if not (9, 0) <= device_arch <= (11, 0):
+                # cuBLAS supports grouped GEMM on Hopper+
+                return False
+            if device_arch[0] == 9 and tex.get_cublasLt_version() < 130500:
+                # Hopper support for grouped GEMM requires cuBLAS 13.5+
+                return False
+            return True
+
+        # FP8 block scaling
+        if all(isinstance(q, Float8BlockQuantizer) for q in input_quantizers):
+            # Grouped GEMM requires Hopper and cuBLAS 13.4+
+            return device_arch[0] == 9 and tex.get_cublasLt_version() >= 130400
+
+        # MXFP8
+        if all(isinstance(q, MXFP8Quantizer) for q in input_quantizers):
+            # MXFP8 grouped quantization requires Blackwell
+            return (10, 0) <= device_arch <= (11, 0)
+
+        # NVFP4
+        if all(isinstance(q, NVFP4Quantizer) for q in input_quantizers):
+            if not (10, 0) <= device_arch <= (11, 0):
+                # NVFP4 grouped quantization requires Blackwell
+                return False
+            if single_grouped_weight:
+                # NVFP4 graph-safe grouped quantization only supports discrete weights
+                return False
+            for q in input_quantizers:
+                if not q.with_rht:
+                    # NVFP4 graph-safe grouped quantization requires RHT
+                    return False
+                if q.scale_dtype != DType.kFloat8E4M3:
+                    # NVFP4 grouped GEMM is only supported with E4M3 scales
+                    return False
+            return True
+
+        # Fall back to non-graph-safe implementation
+        return False
 
     @staticmethod
     def _make_grouped_tensor(

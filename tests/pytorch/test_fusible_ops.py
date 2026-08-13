@@ -82,6 +82,8 @@ if mxfp8_available:
 if nvfp4_available:
     _quantization_list.append("nvfp4")
     _quantization_list.append("nvfp4_4over6")
+    if fp8_ue5m3_available:
+        _quantization_list.append("nvfp4_rht_ue5m3")
 if fp8_block_scaling_available:
     _quantization_list.append("fp8_block_scaling")
 
@@ -99,7 +101,6 @@ def maybe_skip_quantization(
     dims: Optional[Iterable[int] | int] = None,
     device: Optional[torch.device | str] = None,
     dtype: Optional[torch.dtype] = None,
-    fused_grouped_gemm: bool = False,
 ) -> None:
     """Skip test case if a quantization scheme is not supported"""
 
@@ -137,44 +138,16 @@ def maybe_skip_quantization(
         elif quantization in nvfp4_variant_names:
             if math.prod(dims[:-1]) % 16 != 0 or dims[-1] % 16 != 0:
                 pytest.skip("NVFP4 GEMMs require dims that are divisible by 16")
-            if quantization == "nvfp4_rht_ue5m3_scales" and not fused_grouped_gemm and (
-                math.prod(dims[:-1]) % 256 != 0 or dims[-1] % 256 != 0
+            if (
+                quantization in ("nvfp4_ue5m3", "nvfp4_rht_ue5m3")
+                and (math.prod(dims[:-1]) % 64 != 0 or dims[-1] % 64 != 0)
             ):
-                # UE5M3 has no cuBLAS kernels, so these GEMMs route to cuDNN's grouped
-                # kernel, which pads every group to 256 rows. Both dims are constrained,
-                # not just the leading one: wgrad contracts over the tokens, putting the
-                # feature dim in the kernel's ragged position.
-                pytest.skip("NVFP4 UE5M3 GEMMs require dims that are divisible by 256")
+                pytest.skip("cuDNN FE NVFP4-UE5M3 GEMMs produce incorrect values with 32x32 tensors")
 
     # Check dtype
     if dtype is not None:
         if quantization in nvfp4_variant_names and dtype != torch.bfloat16:
             pytest.skip("NVFP4 quantization is only supported with BF16 data")
-
-
-def maybe_resize_for_ue5m3(
-    quantization: Optional[str],
-    weight_shape: tuple[int, int],
-    in_shape: Iterable[int],
-) -> tuple[tuple[int, int], Iterable[int]]:
-    """Grow a test case's shapes to what the NVFP4 UE5M3 GEMM path can run.
-
-    UE5M3 has no cuBLAS kernels, so its GEMMs route to cuDNN's grouped kernel,
-    which pads every group to 256 rows. Every dim is constrained, not just the
-    leading one: wgrad contracts over the tokens, so the feature dim also lands
-    in the kernel's ragged position. Tests share small default shapes to stay
-    fast, so rescale them for this recipe instead of losing the coverage to a
-    skip. Leading dims are collapsed to a single 256-row dim, keeping any extra
-    dims so the >2D cases still exercise the leading-dim handling.
-    """
-    if quantization != "nvfp4_rht_ue5m3_scales":
-        return weight_shape, in_shape
-    leading = list(in_shape)[:-1]
-    if len(leading) == 0:
-        # A 1D input is a single row, which can never reach 256.
-        pytest.skip("NVFP4 UE5M3 GEMMs need at least 256 rows, so 1D inputs cannot run")
-    new_leading = [1] * (len(leading) - 1) + [256]
-    return (256, 256), (*new_leading, -1)
 
 
 @torch.no_grad()
@@ -970,8 +943,6 @@ class TestBasicOps:
     ) -> None:
         """Helper function for tests with GEMM"""
 
-        weight_shape, in_shape = maybe_resize_for_ue5m3(quantization, weight_shape, in_shape)
-
         # Make input and weight shapes consistent
         out_features, in_features = weight_shape
         in_shape = list(in_shape)[:-1] + [in_features]
@@ -980,9 +951,6 @@ class TestBasicOps:
         # Skip invalid configurations
         maybe_skip_quantization(quantization, dims=in_shape, device=device, dtype=dtype)
         maybe_skip_quantization(quantization, dims=out_shape)
-        if quantization == "nvfp4_rht_ue5m3_scales" and accumulate_into_main_grad:
-            # The cuDNN kernel UE5M3 routes to writes its output, with no beta term.
-            pytest.skip("NVFP4 UE5M3 GEMMs cannot accumulate into an existing output")
         quantization_needed = any(
             (
                 quantized_compute,
@@ -2184,11 +2152,6 @@ class TestBasicOps:
             pytest.skip("Quantized group GEMM is only supported with BF16/FP16")
         if quantization == "nvfp4_4over6":
             pytest.skip("NVFP4 4over6 grouped quantization is not supported")
-        if quantization == "nvfp4_rht_ue5m3_scales":
-            # A standalone GroupedLinear issues grouped cuBLAS GEMMs, which have no
-            # UE5M3 kernels. UE5M3 grouped support is limited to the CuteDSL fused
-            # grouped MLP, which routes its GEMMs to cuDNN instead.
-            pytest.skip("UE5M3 scales are not supported by grouped cuBLAS GEMMs")
 
         # Random data
         x_ref, x_test = make_reference_and_test_tensors(
@@ -2611,8 +2574,6 @@ class TestFusedOps:
         quantized_weight: bool,
     ) -> None:
         """Forward GEMM + bias + activation"""
-
-        weight_shape, in_shape = maybe_resize_for_ue5m3(quantization, weight_shape, in_shape)
 
         # Make input and weight shapes consistent
         out_features, in_features = weight_shape
@@ -3603,7 +3564,6 @@ class TestSequentialModules:
     @pytest.mark.parametrize("bias", (False, True))
     @pytest.mark.parametrize("dtype", _dtypes)
     @pytest.mark.parametrize("quantization", _quantization_list)
-    @pytest.mark.parametrize("glu_interleave_size", (None, 32))
     def test_grouped_mlp(
         self,
         *,
@@ -3615,7 +3575,6 @@ class TestSequentialModules:
         device: torch.device = "cuda",
         split_alignment: int = 256,
         activation: str = "scaled_swiglu",
-        glu_interleave_size: Optional[int],
     ) -> None:
         """GroupedLinear + scaled activation + GroupedLinear"""
 
@@ -3641,25 +3600,11 @@ class TestSequentialModules:
             dims=in_shape,
             device=device,
             dtype=dtype,
-            fused_grouped_gemm=True,
         )
         if with_quantization and dtype not in (torch.bfloat16, torch.float16):
             pytest.skip("Quantized group GEMM is only supported with BF16/FP16")
         if activation == "scaled_srelu" and quantization == "nvfp4_rht" and bias:
             pytest.skip("NVFP4 RHT SReLU grouped MLP coverage is limited to no-bias")
-        if (
-            quantization == "nvfp4_rht_ue5m3_scales"
-            and activation == "scaled_swiglu"
-            and glu_interleave_size is None
-        ):
-            # Without interleaving the GLU pattern never matches the CuteDSL fused
-            # grouped MLP, so the ops fall back to grouped cuBLAS, which has no UE5M3
-            # kernels. The glu_interleave_size=32 variant covers this recipe.
-            pytest.skip("UE5M3 grouped MLP is only supported on the fused path")
-        if quantization == "nvfp4_rht_ue5m3_scales" and activation == "scaled_srelu":
-            # The fuser refuses UE5M3 with SReLU outright, since cuDNN has no UE5M3
-            # SReLU kernel, so this would fall back to grouped cuBLAS.
-            pytest.skip("cuDNN has no UE5M3 SReLU kernel, so this cannot use the fused path")
 
         # Random data
         x_ref, x_test = make_reference_and_test_tensors(
@@ -3745,18 +3690,7 @@ class TestSequentialModules:
                 x, fc1_ws_ref[group_idx], bias=fc1_bs_ref[group_idx]
             )
             if activation == "scaled_swiglu":
-                if glu_interleave_size is not None:
-                    # Undo the interleaving so the two GLU halves can be chunked.
-                    act_in = fc1_out.reshape(
-                        -1,
-                        fc1_out_features // (2 * glu_interleave_size),
-                        2,
-                        glu_interleave_size,
-                    )
-                    act_in = act_in.transpose(1, 2).reshape(fc1_out.shape)
-                else:
-                    act_in = fc1_out
-                act_in1, act_in2 = act_in.chunk(2, dim=-1)
+                act_in1, act_in2 = fc1_out.chunk(2, dim=-1)
                 act_out = torch.nn.functional.silu(act_in1) * act_in2
             elif activation == "scaled_srelu":
                 act_out = torch.nn.functional.relu(fc1_out).square()
@@ -3791,7 +3725,7 @@ class TestSequentialModules:
                 scale_bias=bias,
             )
             if activation == "scaled_swiglu":
-                activation_op = te_ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size)
+                activation_op = te_ops.ScaledSwiGLU()
             elif activation == "scaled_srelu":
                 activation_op = te_ops.ScaledSReLU()
             else:
@@ -3841,7 +3775,6 @@ class TestSequentialModules:
             quantization="nvfp4_rht",
             device=device,
             activation="scaled_srelu",
-            glu_interleave_size=None,  # SReLU is not a GLU, so interleaving does not apply
         )
 
 

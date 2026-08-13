@@ -5,6 +5,8 @@
 """Python interface for GEMM extensions"""
 
 from typing import Callable, Iterable, Literal, Optional, Tuple, Union, List
+import itertools
+import math
 import os
 import functools
 import torch
@@ -25,7 +27,6 @@ from ..tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
 from ..tensor.storage.nvfp4_tensor_storage import NVFP4TensorStorage
 from ..tensor.utils import is_custom
 from ..custom_recipes.gemm import custom_gemm
-from ..ops._common import validate_or_alloc_output
 from ...debug.pytorch.debug_quantization import DebugQuantizedTensor, DebugQuantizer
 
 __all__ = [
@@ -189,6 +190,32 @@ def _validate_native_gemm_output_quantizer(quantization_params):
         )
 
 
+def validate_or_alloc_output(
+    buffer: Optional[torch.Tensor],
+    shape: tuple[int, ...] | list[int],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the caller's output buffer, or allocate one if it is None.
+
+    The buffer must be a contiguous tensor matching the required
+    shape, dtype, and device.
+
+    """
+    shape = tuple(shape)
+    if buffer is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+    if tuple(buffer.shape) != shape:
+        raise ValueError(f"Output buffer shape {tuple(buffer.shape)} does not match {shape}.")
+    if buffer.dtype != dtype:
+        raise ValueError(f"Output buffer dtype {buffer.dtype} does not match {dtype}.")
+    if buffer.device != device:
+        raise ValueError(f"Output buffer device {buffer.device} does not match {device}.")
+    if not buffer.is_contiguous():
+        raise ValueError("Output buffer must be contiguous.")
+    return buffer
+
+
 @functools.lru_cache(maxsize=None)
 def grouped_gemm_wgrad_kernel() -> Callable:
     """cuDNN CuTe DSL grouped wgrad kernel for block-scaled inputs."""
@@ -205,9 +232,11 @@ def _cuDNN_wgrad_gemm(
     amax_a: Optional[torch.Tensor],
     amax_b: Optional[torch.Tensor],
     out_dtype: torch.dtype,
-    out: Optional[torch.Tensor],
+    out: torch.Tensor,
     accumulate: bool,
     alpha: Optional[float] = None,
+    beta: Optional[float] = None,
+    bias: Optional[torch.Tensor] = None,
 ) -> Iterable[Optional[torch.Tensor]]:
     """Compute dw = dy^T @ x with cuDNN's purpose-built grouped wgrad kernel."""
 
@@ -215,8 +244,7 @@ def _cuDNN_wgrad_gemm(
     # two values per byte along the token dim.
     tokens_packed = a_tensor.shape[-1]
     tokens = tokens_packed * 2
-    out_features = a_tensor.numel() // tokens_packed
-    in_features = b_tensor.numel() // tokens_packed
+    out_features, in_features = out.size()
 
     # grouped_gemm_wgrad_wrapper_sm100 wants:
     #     a_tensor  (feature_out, tokens)      K-major, FP4-packed
@@ -261,6 +289,10 @@ def _cuDNN_wgrad_gemm(
         accumulate_on_output=accumulate,
         current_stream=torch.cuda.current_stream().cuda_stream,
     )
+
+    # Apply bias
+    if bias is not None:
+        out += bias.view(1, in_features)
 
     # Matches general_gemm's contract: (out, bias_grad, gelu_input, extra_output).
     return out, None, None, None
@@ -395,28 +427,34 @@ def general_cuDNN_MX_gemm(
 
     The parameters passed are in cuBLAS notation, where
     D = alpha * op(B) @ op(A) + beta * C, where the shape is always
-    (M, N) = (M, K) @ (K, N) + (M, N)
+    (N, M) = (N, K) @ (K, M) + (N, M)
 
     B:
-    - "N" is (M, K), which is always TE's rowwise data, and op(B) is B
-    - "T" is (K, M), which is always TE's colwise data, and op(B) is B.T
+    - "N" is (N, K), which is always TE's rowwise data, and op(B) is B
+    - "T" is (K, N), which is always TE's colwise data, and op(B) is B.T
     A
-    - "N" is (K, N), which is always TE's colwise data, and op(A) is A
-    - "T" is (N, K), which is always TE's rowwise data, and op(A) is A.T
+    - "N" is (K, M), which is always TE's colwise data, and op(A) is A
+    - "T" is (M, K), which is always TE's rowwise data, and op(A) is A.T
 
     Note: layout string means layout of "A" and "B" respectively.
 
     TE stores x (token, feature_in), w (feature_out, feature_in) and dy (token, feature_out) in physical rowwise direction.
     For cuBLAS:
-    fprop = x @ wT: token is M, feature_in is K, feature_out is N, so it's TN (x as B, w transposed to wT as A)
-    dgrad = dy @ w: token is M, feature_out is K, feature_in is N, so it's NN (dy as B, w as A)
-    wgrad = dyT @ x: feature_out is M, token is K, feature_in is N, so it's NT (dy transposed to dyT as B, x as A)
+    fprop = x @ wT: token is N, feature_in is K, feature_out is M, so it's TN (x as B, w transposed to wT as A)
+    dgrad = dy @ w: token is N, feature_out is K, feature_in is M, so it's NN (dy as B, w as A)
+    wgrad = dyT @ x: feature_out is N, token is K, feature_in is M, so it's NT (dy transposed to dyT as B, x as A)
 
     We use cuDNN-frontend's APIs here which are supposed to be used for grouped GEMM but we set groups = 1
     so it is effectively a single GEMM.
 
     Naming convention: uppercase letters (A, B) are used for cuBLAS notation, lowercase letters (a, b) are used for cuDNN notation.
                        where cuBLAS's B is cuDNN's a, and cuBLAS's A is cuDNN's b (their notation is inverted).
+
+    This function is a temporary hack until TE supports NVFP4-UE5M3
+    GEMMs natively. This should not be used externally and once native
+    GEMM support is added then this function (and related helper
+    functions) should be removed entirely.
+
     """
     assert isinstance(A, NVFP4TensorStorage) and isinstance(B, NVFP4TensorStorage) and \
         A.get_metadata()["scale_dtype"] == DType.kFloat8UE5M3 and B.get_metadata()["scale_dtype"] == DType.kFloat8UE5M3, \
@@ -471,55 +509,84 @@ def general_cuDNN_MX_gemm(
     else:
         dataA, sfA, amaxA = A._columnwise_data, A._columnwise_scale_inv, A._amax_columnwise
 
-    # Find the logical shapes (not the physical shapes where K is packed with 2 fp4 stored in 1 byte).
-    M, K = dataB.numel() // dataB.shape[-1], dataB.shape[-1] * 2
-    N, k_from_a = dataA.numel() // dataA.shape[-1], dataA.shape[-1] * 2
-    assert K == k_from_a, f"Contraction dims disagree: A implies {k_from_a}, B implies {K}."
+    # Input tensor dims
+    A_shape = list(dataA.size())
+    A_shape[-1] *= 2
+    B_shape = list(dataB.size())
+    B_shape[-1] *= 2
 
-    # Route NT (implying wgrad) to cuDNN-FE's wgrad API instead of the general GEMM one
-    if layout == "NT" and bias is None: # The wgrad kernel has no bias epilogue
+    # GEMM dimensions
+    M_full = A_shape[:-1] if transa else [A_shape[0]]
+    N_full = [B_shape[0]] if transb else B_shape[:-1]
+    K_full = [A_shape[-1]] if transa else A_shape[1:]
+    K_full_b = B_shape[1:] if transb else [B_shape[-1]]
+    assert K_full == K_full_b, f"Contraction dims disagree: A implies {K_full}, B implies {K_full_b}."
+    M = math.prod(M_full)
+    N = math.prod(N_full)
+    K = math.prod(K_full)
+
+    # Allocate output tensor if needed
+    out_shape = N_full + M_full
+    out = validate_or_alloc_output(out, out_shape, out_dtype, device)
+
+    # Trivial cases
+    if K == 0:
+        if bias is not None:
+            out_2d = out.view(N, M)
+            bias_2d = bias.view(1, M)
+            if accumulate:
+                out_2d += bias_2d
+            else:
+                out_2d.copy_(bias_2d)
+        elif not accumulate:
+            out.zero_()
+        return out, None, None, None
+    if M == 0 or N == 0:
+        return out, None, None, None
+
+    # Route to cuDNN-FE's wgrad API for cases not supported by the
+    # grouped GEMM (accumulation to output tensor, insufficient
+    # alignment). The wgrad kernel has no bias epilogue, so any bias
+    # has to be applied after the GEMM.
+    if accumulate or N % 256 != 0:
         alpha = alpha if alpha is not None else 1.0
         # This path uses cuDNN's wgrad (grouped_gemm_wgrad_wrapper_sm100) which supports grad accumulation
-        if accumulate: # Accumulate GEMM's result to the out tensorn
+        if accumulate: # Accumulate GEMM's result to the out tensor
             assert beta in (1.0, None), "beta must be one or None if accumulate is True"
         else: # Overwrite GEMM's result to the out tensor
             assert beta in (0.0, None), "beta must be zero or None if not accumulate"
-        return _cuDNN_wgrad_gemm(
-            a_tensor=dataB,
-            b_tensor=dataA,
+        _cuDNN_wgrad_gemm(
+            a_tensor=dataB.view(N, K // 2),
+            b_tensor=dataA.view(M, K // 2),
             sfa=sfB,
             sfb=sfA,
             amax_a=amaxB,
             amax_b=amaxA,
             out_dtype=out_dtype,
-            out=out,
+            out=out.view(N, M),
             accumulate=accumulate,
-            alpha=alpha
+            alpha=alpha,
+            bias=bias,
         )
+        return out, None, None, None
 
     alpha = alpha if alpha is not None else 1.0
     # cuDNN's general GEMM path (grouped_gemm_quant_wrapper_sm100) doesn't support accumulation
     assert accumulate is False, "cuDNN GEMM currently does not support accumulation for this operation."
     assert beta in (0.0, None), "beta must be zero or None if not accumulate"
 
-    # The output keeps B's leading dims. They only exist when B is read row-wise:
-    # the column-wise NVFP4 buffer is physically transposed and always 2D, and the
-    # layouts that select it give B the logical shape (K, M).
-    out_shape = (*dataB.shape[:-1], N) if not transb else (M, N)
-
     # cuDNN's grouped quant kernel requires M to be divisible by 256 so we need to pad it
-    M_padded = ceil_div(M, 256) * 256
-    if M_padded != M:
-        k_packed = dataB.shape[-1]
-        src = dataB.reshape(M, k_packed)
-        buf = src.new_zeros((M_padded, k_packed))
-        buf[:M].copy_(src)
+    N_padded = ceil_div(N, 256) * 256
+    if N_padded != N:
+        src = dataB.reshape(N, K // 2)
+        buf = src.new_zeros((N_padded, K // 2))
+        buf[:N].copy_(src)
         dataB = buf
 
         # Swizzled scales are blocked by 128 rows:
         # (1, ceil(M/128), k_sf_tiles, 32, 4, 4)
         per_block = ceil_div(K, 4 * NVFP4_BLOCK_SCALING_SIZE) * 32 * 4 * 4
-        n_blk, n_blk_padded = ceil_div(M, 128), ceil_div(M_padded, 128)
+        n_blk, n_blk_padded = ceil_div(N, 128), ceil_div(N_padded, 128)
         src_sf = sfB.reshape(-1)[: n_blk * per_block].reshape(n_blk, per_block)
         buf_sf = src_sf.new_zeros((n_blk_padded, per_block))
         buf_sf[:n_blk].copy_(src_sf)
@@ -533,7 +600,7 @@ def general_cuDNN_MX_gemm(
         sfB,
         data_dtype=torch.float4_e2m1fn_x2,
         scale_dtype=torch.float8_e4m3fn,  # e5m3 rides as e4m3; torch has no ue5m3
-        valid_M_or_N=M_padded,
+        valid_M_or_N=N_padded,
         k_logical=K,
         L=1,
         sf_swizzled=True,  # ensured above
@@ -543,7 +610,7 @@ def general_cuDNN_MX_gemm(
         sfA,
         data_dtype=torch.float4_e2m1fn_x2,
         scale_dtype=torch.float8_e4m3fn,  # e5m3 rides as e4m3; torch has no ue5m3
-        valid_M_or_N=N,
+        valid_M_or_N=M,
         k_logical=K,
         L=1,
         sf_swizzled=True,  # ensured above
@@ -567,20 +634,20 @@ def general_cuDNN_MX_gemm(
     alpha_tensor = (alpha * scaleA * scaleB).to(torch.float32)
 
     if bias is not None:
-        assert bias.dim() == 1 and bias.shape[0] == N, (
-            f"cuDNN MX GEMM expects a ({N},) bias, but got {tuple(bias.shape)}."
+        assert bias.dim() == 1 and bias.shape[0] == M, (
+            f"cuDNN MX GEMM expects a ({M},) bias, but got {tuple(bias.shape)}."
         )
         # cuDNN checks the stride literally, so (1, N) rather than reshape's (1, 1).
-        bias = bias.contiguous().as_strided((N, 1), (1, N))
+        bias = bias.contiguous().as_strided((M, 1), (1, M))
 
     # Prepare for output
     out = validate_or_alloc_output(out, out_shape, out_dtype, device)
-    if M_padded != M:
-        # The kernel writes M_padded rows, so it cannot target `out` directly.
-        d_buf = torch.empty((M_padded, N), dtype=out_dtype, device=device)
-        d_tensor = d_buf.as_strided((M_padded, N, 1), (N, 1, M_padded * N))
+    if N_padded != N:
+        # The kernel writes N_padded rows, so it cannot target `out` directly.
+        d_buf = torch.empty((N_padded, M), dtype=out_dtype, device=device)
+        d_tensor = d_buf.as_strided((N_padded, M, 1), (M, 1, N_padded * M))
     else:
-        d_tensor = out.view(M, N).as_strided((M, N, 1), (N, 1, M * N))
+        d_tensor = out.view(N, M).as_strided((N, M, 1), (M, 1, M * N))
 
     gemm_kwargs = {
         "a_tensor": cudnn_a,
@@ -588,7 +655,7 @@ def general_cuDNN_MX_gemm(
         "b_tensor": cudnn_b,
         "sfb_tensor": cudnn_sfb,
         # One group, so the only padded end offset is the full row count.
-        "padded_offsets": torch.tensor([M_padded], dtype=torch.int32, device=device),
+        "padded_offsets": torch.tensor([N_padded], dtype=torch.int32, device=device),
         "alpha_tensor": alpha_tensor,
         "bias_tensor": bias,
         "norm_const_tensor": None,  # must be None for FP4 inputs
@@ -604,10 +671,10 @@ def general_cuDNN_MX_gemm(
     }
     grouped_gemm_quant_kernel()(**gemm_kwargs)
 
-    if M_padded != M:
+    if N_padded != N:
         # Drop the zero-padded rows. Safe to overwrite rather than accumulate:
         # this path asserts accumulate is False above.
-        out.view(M, N).copy_(d_buf[:M])
+        out.view(N, M).copy_(d_buf[:N])
 
     # Matches general_gemm's contract: (out, bias_grad, gelu_input, extra_output).
     return out, None, None, None
@@ -635,18 +702,31 @@ def general_gemm(
 ) -> Iterable[Optional[torch.Tensor]]:
     """GEMM supporting fp8 inputs."""
 
-    route_to_cuDNN = False
-    # Route NVFP4 GEMM with e5m3 scale factors to cuDNN since cuBLAS is not ready yet.
-    # Test against the storage class, not NVFP4Tensor: the ops and module paths hand
-    # this function bare NVFP4TensorStorage operands, and NVFP4Tensor subclasses it.
-    if isinstance(A, NVFP4TensorStorage) and isinstance(B, NVFP4TensorStorage):
-        if (
-            A.get_metadata()["scale_dtype"] == DType.kFloat8UE5M3
-            and B.get_metadata()["scale_dtype"] == DType.kFloat8UE5M3
-        ):
-            route_to_cuDNN = True
+    assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
+    transa = layout[0] == "T"
+    transb = layout[1] == "T"
 
-    if route_to_cuDNN:
+    debug_quantizer = None
+    if isinstance(quantization_params, DebugQuantizer):
+        debug_quantizer = quantization_params
+        quantization_params = quantization_params.parent_quantizer
+
+    A = _unwrap_tensor(A, "rowwise" if transa else "columnwise")
+    B = _unwrap_tensor(B, "columnwise" if transb else "rowwise")
+
+    alpha = validate_gemm_scale(alpha, True)
+    beta = validate_gemm_scale(beta, accumulate)
+    workspace = get_cublas_workspace(A.device.index, ub is not None, False)
+
+    # Temporary hack to route NVFP4 GEMM with UE5M3 scale factors to
+    # cuDNN Frontend kernels. UE5M3-specific logic should be removed
+    # in its entirety once TE supports NVFP4-UE5M3 GEMMs natively.
+    if (
+        isinstance(A, NVFP4TensorStorage)
+        and isinstance(B, NVFP4TensorStorage)
+        and A._scale_dtype == DType.kFloat8UE5M3
+        and B._scale_dtype == DType.kFloat8UE5M3
+    ):
         return general_cuDNN_MX_gemm(
             A,
             B,
@@ -667,22 +747,6 @@ def general_gemm(
             extra_output,
             bulk_overlap,
         )
-
-    assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
-    transa = layout[0] == "T"
-    transb = layout[1] == "T"
-
-    debug_quantizer = None
-    if isinstance(quantization_params, DebugQuantizer):
-        debug_quantizer = quantization_params
-        quantization_params = quantization_params.parent_quantizer
-
-    A = _unwrap_tensor(A, "rowwise" if transa else "columnwise")
-    B = _unwrap_tensor(B, "columnwise" if transb else "rowwise")
-
-    alpha = validate_gemm_scale(alpha, True)
-    beta = validate_gemm_scale(beta, accumulate)
-    workspace = get_cublas_workspace(A.device.index, ub is not None, False)
 
     if ub_type is not None:
         assert ub is not None, (
@@ -798,7 +862,7 @@ def general_gemm(
         gemm_kwargs = dict(kwargs)
         gemm_kwargs["beta"] = 0.0
         out, bias_grad, gelu_input, extra_output = tex.generic_gemm(*gemm_args, **gemm_kwargs)
-        out_2d = out.reshape(-1, out.shape[-1])
+        out_2d = out.view(N, M)
 
         assert output_row_scales.numel() in (1, out_2d.shape[0])
         assert output_col_scales.numel() in (1, out_2d.shape[1])
@@ -886,71 +950,48 @@ def general_grouped_gemm(
 
     if any(_is_nvfp4_row_scaled_tensor(tensor) for tensor in A):
         raise NotImplementedError("Row-scaled NVFP4 grouped GEMM does not support row-scaled A.")
-    if any(_is_nvfp4_row_scaled_tensor(tensor) for tensor in B):
-        assert D_dtype is None, "Row-scaled NVFP4 grouped GEMM currently does not support D_dtype."
-        if single_output:
-            assert (
-                m_splits is not None
-            ), "Row-scaled NVFP4 grouped GEMM requires m_splits with single output."
-        out_init = out[0] if single_output else None
+
+    # Determine whether to repeatedly call general_gemm
+    use_general_gemm_impl = False
+    if isinstance(quantization_params[0], DebugQuantizer):
+        use_general_gemm_impl = True
+    elif any(_is_nvfp4_row_scaled_tensor(tensor) for tensor in B):
+        use_general_gemm_impl = True
+    elif any(
+        isinstance(t, NVFP4TensorStorage) and t._scale_dtype == DType.kFloat8UE5M3
+        for t in itertools.chain(A, B)
+    ):
+        use_general_gemm_impl = True
+
+    # Repeatedly call general_gemm if needed
+    if use_general_gemm_impl:
+        out_views = out
         if single_output:
             start_idx = 0
-            out_views = []
+            out = out[0]
+            out_views = [None] * num_gemms
             for i in range(num_gemms):
                 size = m_splits[i]
-                out_views.append(out_init[start_idx : start_idx + size])
+                out_views[i] = out[start_idx : start_idx + size]
                 start_idx += size
-        else:
-            out_views = out
         for i in range(num_gemms):
-            if out_views[i].numel() == 0:
-                continue
-            general_gemm(
+            _, bias_or_grad, gelu_input_i, _ = general_gemm(
                 A[i],
                 B[i],
                 quantization_params=quantization_params[i],
                 out_dtype=out_views[i].dtype,
+                layout=layout,
+                accumulate=accumulate,
                 out=out_views[i],
-                gelu=gelu,
-                accumulate=accumulate,
-                layout=layout,
-                bias=bias[i] if use_bias else None,
-                use_split_accumulator=use_split_accumulator,
-                grad=grad,
-            )
-        if single_output:
-            out = out_init
-        return out, grad_bias, gelu_input
-
-    if isinstance(quantization_params[0], DebugQuantizer):
-        assert not gelu, "GELU not supported in debug mode"
-        if single_output:
-            out_init = out[0]
-            start_idx = 0
-            out = [None] * num_gemms
-            for i in range(num_gemms):
-                size = m_splits[i]
-                out[i] = out_init[start_idx : start_idx + size]
-                start_idx += size
-        for i in range(num_gemms):
-            _, bias_or_grad, _, _ = general_gemm(
-                A[i],
-                B[i],
-                quantization_params=quantization_params[i],
-                out_dtype=out[0].dtype,
-                layout=layout,
-                accumulate=accumulate,
-                out=out[i],
                 bias=bias[i] if use_bias else None,
                 use_split_accumulator=use_split_accumulator,
                 grad=grad,
             )
             if grad and use_bias:
                 grad_bias[i] = bias_or_grad
-        if single_output:
-            out = out_init
-
-        return out, grad_bias if grad else bias, None
+            if gelu:
+                gelu_input[i] = gelu_input_i
+        return out, grad_bias if grad else bias, gelu_input
 
     if gelu:
         gelu_input = [
