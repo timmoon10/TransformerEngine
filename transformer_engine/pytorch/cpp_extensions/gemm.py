@@ -231,19 +231,13 @@ def _cudnn_grouped_gemm_quant_kernel() -> Callable:
     return grouped_gemm_quant_wrapper_sm100
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache
 def _get_cached_offsets_tensor(
     value: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Return a cached int32 one-element offsets tensor.
-
-    Building this inline with ``torch.tensor([v], device=<cuda>)`` materializes an
-    unpinned CPU tensor and copies it H2D, which CUDA rejects during graph capture.
-    Caching by ``(value, device)`` moves that copy to warmup and keeps the data
-    pointer stable across CUDA graph replays, matching ``get_cached_ones_tensor``.
-    """
-    return torch.tensor([value], dtype=torch.int32, device=device)
+    """Return a cached int32 one-element offsets tensor."""
+    return torch.full((1,), value, dtype=torch.int32, device=device)
 
 
 @functools.lru_cache(maxsize=None)
