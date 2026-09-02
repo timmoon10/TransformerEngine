@@ -457,15 +457,17 @@ def _gemm_swizzled_scales(
     """
     if tensor._with_gemm_swizzled_scales:
         return tensor._rowwise_scale_inv, tensor._columnwise_scale_inv
-    rowwise, columnwise = tensor._rowwise_scale_inv, tensor._columnwise_scale_inv
-    try:
-        tensor._rowwise_scale_inv = None if rowwise is None else rowwise.clone()
-        tensor._columnwise_scale_inv = None if columnwise is None else columnwise.clone()
-        tex.swizzle_scales_for_gemm_(tensor)
-        return tensor._rowwise_scale_inv, tensor._columnwise_scale_inv
-    finally:
-        tensor._rowwise_scale_inv, tensor._columnwise_scale_inv = rowwise, columnwise
-        tensor._with_gemm_swizzled_scales = False
+    compact_rowwise = tensor._rowwise_scale_inv
+    compact_columnwise = tensor._columnwise_scale_inv
+    swizzled_rowwise = None if compact_rowwise is None else compact_rowwise.clone()
+    swizzled_columnwise = None if compact_columnwise is None else compact_columnwise.clone()
+    tensor._rowwise_scale_inv = swizzled_rowwise
+    tensor._columnwise_scale_inv = swizzled_columnwise
+    tex.swizzle_scales_for_gemm_(tensor)
+    tensor._rowwise_scale_inv = compact_rowwise
+    tensor._columnwise_scale_inv = compact_columnwise
+    tensor._with_gemm_swizzled_scales = False
+    return swizzled_rowwise, swizzled_columnwise
 
 
 def _cudnn_grouped_gemm_nvfp4_ue5m3(
