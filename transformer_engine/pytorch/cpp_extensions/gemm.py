@@ -440,6 +440,34 @@ def _convert_to_cudnn_grouped_gemm_tensor_format(
     return data, scale_inv
 
 
+def _gemm_swizzled_scales(
+    tensor: NVFP4TensorStorage,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Return GEMM-swizzled (rowwise, columnwise) scales without mutating the tensor.
+
+    ``tex.swizzle_scales_for_gemm_`` swizzles in place and marks the tensor as
+    swizzled. That mark must not persist on weights: the master-weight cast
+    (``_cast_master_weights_to_nvfp4_2d``) rewrites their scales in the
+    unswizzled layout and leaves the mark alone, so the next GEMM would read
+    unswizzled scales as swizzled. Swizzle clones instead and restore the
+    original attributes.
+
+    This function is a temporary hack until TE supports NVFP4-UE5M3
+    GEMMs natively.
+    """
+    if tensor._with_gemm_swizzled_scales:
+        return tensor._rowwise_scale_inv, tensor._columnwise_scale_inv
+    rowwise, columnwise = tensor._rowwise_scale_inv, tensor._columnwise_scale_inv
+    try:
+        tensor._rowwise_scale_inv = None if rowwise is None else rowwise.clone()
+        tensor._columnwise_scale_inv = None if columnwise is None else columnwise.clone()
+        tex.swizzle_scales_for_gemm_(tensor)
+        return tensor._rowwise_scale_inv, tensor._columnwise_scale_inv
+    finally:
+        tensor._rowwise_scale_inv, tensor._columnwise_scale_inv = rowwise, columnwise
+        tensor._with_gemm_swizzled_scales = False
+
+
 def _cudnn_grouped_gemm_nvfp4_ue5m3(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -520,12 +548,10 @@ def _cudnn_grouped_gemm_nvfp4_ue5m3(
     # cuDNN only accepts GEMM-swizzled scale factors -- an unswizzled buffer is
     # rejected on its strides -- so swizzle first if the quantizer did not
     # (optimize_for_gemm defaults to False). This mirrors what the cuBLAS path
-    # does in C++ via swizzle_scales_for_gemm. The call is in-place, swizzles
-    # both orientations, and no-ops when the tensor is already swizzled.
-    if not A._with_gemm_swizzled_scales:
-        tex.swizzle_scales_for_gemm_(A)
-    if not B._with_gemm_swizzled_scales:
-        tex.swizzle_scales_for_gemm_(B)
+    # does in C++ via swizzle_scales_for_gemm, and like that path it leaves the
+    # operands untouched.
+    sfA_rowwise, sfA_columnwise = _gemm_swizzled_scales(A)
+    sfB_rowwise, sfB_columnwise = _gemm_swizzled_scales(B)
 
     # `grad` only changes behaviour when a bias is supplied: it turns the bias slot
     # into a bias-gradient output, which cuDNN has no epilogue for. Backward GEMMs
@@ -538,14 +564,14 @@ def _cudnn_grouped_gemm_nvfp4_ue5m3(
     # buffer is physically (rows, K_packed), so the reshape below is uniform.
     # LHS is always (M, K)
     if transb:
-        dataB, sfB, amaxB = B._columnwise_data, B._columnwise_scale_inv, B._amax_columnwise
+        dataB, sfB, amaxB = B._columnwise_data, sfB_columnwise, B._amax_columnwise
     else:
-        dataB, sfB, amaxB = B._rowwise_data, B._rowwise_scale_inv, B._amax_rowwise
+        dataB, sfB, amaxB = B._rowwise_data, sfB_rowwise, B._amax_rowwise
     # RHS is always (K, N)
     if transa:
-        dataA, sfA, amaxA = A._rowwise_data, A._rowwise_scale_inv, A._amax_rowwise
+        dataA, sfA, amaxA = A._rowwise_data, sfA_rowwise, A._amax_rowwise
     else:
-        dataA, sfA, amaxA = A._columnwise_data, A._columnwise_scale_inv, A._amax_columnwise
+        dataA, sfA, amaxA = A._columnwise_data, sfA_columnwise, A._amax_columnwise
 
     # Input tensor dims
     A_shape = list(dataA.size())
