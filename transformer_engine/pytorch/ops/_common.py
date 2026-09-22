@@ -119,27 +119,6 @@ def validate_ep_buffer(
     return buffer
 
 
-def validate_ep_comms_recipe(
-    op_name: str,
-    quantizer: Optional[Quantizer],
-    buffer_recipe: object,
-) -> None:
-    """Require the buffer recipe to match the Op's quantizer role."""
-    if isinstance(quantizer, MXFP8Quantizer):
-        from transformer_engine.common.recipe import MXFP8BlockScaling
-
-        if not isinstance(buffer_recipe, MXFP8BlockScaling):
-            raise ValueError(
-                f"{op_name} selected MXFP8 Comms from its quantizer role, but the "
-                "runtime EpBuffer does not have an MXFP8BlockScaling recipe."
-            )
-    elif buffer_recipe is not None:
-        raise ValueError(
-            f"{op_name} selected BF16 Comms from its quantizer role, but the "
-            f"runtime EpBuffer has recipe {type(buffer_recipe).__name__}."
-        )
-
-
 def validate_or_alloc_output(
     buffer: Optional[torch.Tensor],
     shape: tuple[int, ...] | list[int],

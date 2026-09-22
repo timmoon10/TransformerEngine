@@ -23,15 +23,15 @@ from .all_gather import AllGather
 from .all_reduce import AllReduce
 from .basic_linear import BasicLinear
 from .bias import Bias
-from .combine import MoeCombine
 from .constant_scale import ConstantScale
-from .dispatch import MoeDispatch
 from .dropout import Dropout
 from .grouped_linear import GroupedLinear, is_op_fuser_grouped_tensor_path_supported
 from .identity import Identity
 from .l2normalization import L2Normalization
 from .layer_norm import LayerNorm
 from .make_extra_output import MakeExtraOutput
+from .moe_combine import MoeCombine
+from .moe_dispatch import MoeDispatch
 from .quantize import Quantize
 from .reduce_scatter import ReduceScatter
 from .reshape import Reshape
